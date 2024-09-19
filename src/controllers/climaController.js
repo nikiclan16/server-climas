@@ -12,8 +12,8 @@ exports.climaController = async (req, res) => {
         //Validamos que la fecha anterior a la fecha actual este registrada, si no lo está consume la API con los días correspondientes
         const diaAnterior = moment().add(-1, 'day').format('YYYY-MM-DD')
         const buscarConsumoAPI2 = await pool.query(QUERYS.buscarUltimaFechaClimaLog, [diaAnterior])
-        //if(buscarConsumoAPI2.rowCount == 0){
-        if(true){
+        if(buscarConsumoAPI2.rowCount == 0){
+        //if(true){
             let totaldias = 0;
             //Tenemos en cuenta la ultima fecha para cargar la o las fecha faltantes hasta el día anterior
             const buscarConsumoAPI = await pool.query(QUERYS.buscarUltimaFechaClima);
@@ -31,10 +31,10 @@ exports.climaController = async (req, res) => {
                 //Busca la key de la API
                 const bKeyH = await pool.query(QUERYS.buscarKey, [15]);
                 if (ucp.rowCount > 0){
-                    if(true){
-                        //for(const fila of ucp.data.rows){
-                            //switch (fila.aux2){
-                            switch ("Cartagena"){
+                    //if(true){
+                        for(const fila of ucp.data.rows){
+                            switch (fila.aux2){
+                            //switch ("Cartagena"){
                                 case "Cartagena":
                                     ciudadID = "107563";
                                     ciudad = "Cartagena";
@@ -203,10 +203,10 @@ exports.climaController = async (req, res) => {
             //INICIO DE PRONÓSTICO
             const bKeyP = await pool.query(QUERYS.buscarKey, [12]);
             if (ucp.rowCount > 0){
-                if(true){
-                //for(const fila of ucp.data.rows){
-                    //switch (fila.aux2){
-                    switch ("Barranquilla"){
+                //if(true){
+                for(const fila of ucp.data.rows){
+                    switch (fila.aux2){
+                    //switch ("Barranquilla"){
                         case "Barranquilla":
                             ciudadID = "3689147";
                             ciudad = "Barranquilla";
@@ -362,11 +362,11 @@ exports.climaController = async (req, res) => {
                 saveLog(`${moment().format('DD-MM-YYYY HH:mm:ss')} => No se encuentró Mercados registrados para Pronóstico\n`)
             }
             //FIN DE PRONÓSTICO
+            return res.json({ success: true, message: `OK` })
         }else{
             saveLog(`${moment().format('DD-MM-YYYY HH:mm:ss')} => Ya se ha generado el registro para la fecha ${diaAnterior}\n`)
             return res.json({ success: false, message: `Ya se ha generado el registro para la fecha ${diaAnterior}` })
         }
-        return res.json({ success: true, message: `OK` })
     } catch (error) {
         saveLog(`${moment().format('DD-MM-YYYY HH:mm:ss')} => Error: ${error}\n`)
         return res.json({ success: false, message: `Error: ${error}` })
