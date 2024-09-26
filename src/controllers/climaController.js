@@ -2,13 +2,13 @@ const { Query } = require('pg')
 const pool = require('../config')
 const { QUERYS } = require('../querys')
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
-const HttpProxyAgent = require("http-proxy-agent");
+//const HttpProxyAgent = require("http-proxy-agent");
 const moment = require('moment')
 const {saveLog} = require('../helpers/index')
 
 exports.climaController = async (req, res) => {
     try {
-        const proxyAgent = new HttpProxyAgent.HttpProxyAgent(process.env.URL_PROXY);
+        //const proxyAgent = new HttpProxyAgent.HttpProxyAgent(process.env.URL_PROXY);
         //Validamos que la fecha anterior a la fecha actual este registrada, si no lo está consume la API con los días correspondientes
         const diaAnterior = moment().add(-1, 'day').format('YYYY-MM-DD')
         const buscarConsumoAPI2 = await pool.query(QUERYS.buscarUltimaFechaClimaLog, [diaAnterior])
@@ -54,9 +54,9 @@ exports.climaController = async (req, res) => {
                             }
                             if(bKeyH.rowCount  > 0){
                                 const apiHistorico = `http://dataservice.accuweather.com/currentconditions/v1/${ciudadID}/historical/24?apikey=${bKeyH.rows[0].aux}&language=es&details=true`
-                                const responseHistorico = await fetch(apiHistorico, { agent: proxyAgent });
+                                const responseHistorico = await fetch(apiHistorico/* , { agent: proxyAgent } */);
                                 const dataHistorico = await responseHistorico.json();
-                                //console.log(dataHistorico); // Outputs the fetched data
+                                console.log(dataHistorico); // Outputs the fetched data
                                 
                                 saveLog(`${moment().format('DD-MM-YYYY HH:mm:ss')} => Se inició el proceso para Históstico correctamente\n`)
                                 //Armamos el proceso de almacenamiento en el array
@@ -226,9 +226,9 @@ exports.climaController = async (req, res) => {
                     }
                     if(bKeyP.rowCount > 0){
                         const apiPronostico = `http://api.openweathermap.org/data/2.5/forecast?id=${ciudadID}&APPID=${bKeyP.rows[0].aux}&units=metric`
-                        const responsePronostico = await fetch(apiPronostico, { agent: proxyAgent });
+                        const responsePronostico = await fetch(apiPronostico/* , { agent: proxyAgent } */);
                         const dataPronostico = await responsePronostico.json();
-                        //console.log(JSON.stringify(dataPronostico)); // Outputs the fetched data
+                        console.log(JSON.stringify(dataPronostico)); // Outputs the fetched data
 
                         saveLog(`${moment().format('DD-MM-YYYY HH:mm:ss')} => Se inició el proceso para Pronóstico correctamente\n`)
                         for(const dataP of dataPronostico.list){
