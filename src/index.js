@@ -4,6 +4,8 @@ const bodyParser = require("body-parser");
 const cors =  require("cors");
 const colors = require("colors")
 require('dotenv').config()
+const cron = require('node-cron')
+const { climaController } = require('./controllers/climaController')
 
 async function startServer() {
     //crear el servidor
@@ -28,6 +30,12 @@ async function startServer() {
         ${colors.green(`Server ${colors.blue(process.env.PROYECT)} listening on port:`)} ${colors.blue(process.env.PORT)}  🛡️
         ${colors.yellow('########################################################')}`);
     });
+    //Schedule automatic of process
+    cron.schedule('00 5 * * *', () =>{
+        //All days a the 5:00AM
+        //console.log('***')
+        climaController()
+    })
 }
 
 startServer()
