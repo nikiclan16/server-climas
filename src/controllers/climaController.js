@@ -34,6 +34,7 @@ exports.climaController = async (req, res) => {
       if (totaldias > 0) {
         let ciudadID = "";
         let ciudad = "";
+        let ucpMC = "";
         //Busca la key de la API
         const bKeyH = await pool.query(QUERYS.buscarKey, [15]);
         if (ucp.rowCount > 0) {
@@ -44,6 +45,7 @@ exports.climaController = async (req, res) => {
               case "Antioquia":
                 ciudadID = "107060";
                 ciudad = "Medellin";
+                ucpMC = fila.aux2;
                 break;
             }
             if (bKeyH.rowCount > 0) {
@@ -107,19 +109,19 @@ exports.climaController = async (req, res) => {
                       //Para temperatura
                       const bfechaclimaTemp = await pool.query(
                         QUERYS.buscarClimaPeriodos,
-                        [ciudad, fechaAnterior]
+                        [ucpMC, fechaAnterior]
                       );
                       if (bfechaclimaTemp.rowCount == 0) {
                         if (p == 0) {
                           await pool.query(QUERYS.agregarClimaPronosticoLog, [
                             fechaAnterior,
-                            ciudad,
+                            ucpMC,
                           ]); //Guardamos el log de las fechas registradas
                           const valor24 = parseFloat(
                             arrayHistorico[23].periodos[`p24_t`]
                           ).toFixed(4);
                           await pool.query(
-                            `INSERT INTO datos_clima (fecha, ucp, p24_t) VALUES ('${fechaAnterior}', '${ciudad}', ${valor24})`
+                            `INSERT INTO datos_clima (fecha, ucp, p24_t) VALUES ('${fechaAnterior}', '${ucpMC}', ${valor24})`
                           );
 
                           const valor = parseFloat(
@@ -128,7 +130,7 @@ exports.climaController = async (req, res) => {
                           await pool.query(
                             `UPDATE datos_clima SET p${
                               p + 1
-                            }_t=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ciudad}'`
+                            }_t=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
                           );
                         } else {
                           const valor = parseFloat(
@@ -137,7 +139,7 @@ exports.climaController = async (req, res) => {
                           await pool.query(
                             `INSERT INTO datos_clima (fecha, ucp, p${
                               p + 1
-                            }_t) VALUES ('${fechaAnterior}', '${ciudad}', ${valor})`
+                            }_t) VALUES ('${fechaAnterior}', '${ucpMC}', ${valor})`
                           );
                         }
                       } else {
@@ -146,7 +148,7 @@ exports.climaController = async (req, res) => {
                             arrayHistorico[p].periodos[`p${p + 1}_t`]
                           ).toFixed(4);
                           await pool.query(
-                            `UPDATE datos_clima SET p24_t=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ciudad}'`
+                            `UPDATE datos_clima SET p24_t=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
                           );
                         } else {
                           const valor = parseFloat(
@@ -155,7 +157,7 @@ exports.climaController = async (req, res) => {
                           await pool.query(
                             `UPDATE datos_clima SET p${
                               p + 1
-                            }_t=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ciudad}'`
+                            }_t=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
                           );
                         }
                       }
@@ -163,7 +165,7 @@ exports.climaController = async (req, res) => {
                       //Para humedad
                       const bfechaclimaHume = await pool.query(
                         QUERYS.buscarClimaPeriodos,
-                        [ciudad, fechaAnterior]
+                        [ucpMC, fechaAnterior]
                       );
                       if (bfechaclimaHume == null) {
                         const valor = parseFloat(
@@ -172,7 +174,7 @@ exports.climaController = async (req, res) => {
                         await pool.query(
                           `INSERT INTO datos_clima (fecha, ucp, p${
                             p + 1
-                          }_h) VALUES ('${fechaAnterior}', '${ciudad}', ${valor})`
+                          }_h) VALUES ('${fechaAnterior}', '${ucpMC}', ${valor})`
                         );
                       } else {
                         if (p == 0) {
@@ -180,7 +182,7 @@ exports.climaController = async (req, res) => {
                             arrayHistorico[p].periodos[`p${p + 1}_h`]
                           ).toFixed(4);
                           await pool.query(
-                            `UPDATE datos_clima SET p24_h=${valor24} WHERE fecha='${fechaAnterior}' AND ucp='${ciudad}'`
+                            `UPDATE datos_clima SET p24_h=${valor24} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
                           );
 
                           const valor = parseFloat(
@@ -189,7 +191,7 @@ exports.climaController = async (req, res) => {
                           await pool.query(
                             `UPDATE datos_clima SET p${
                               p + 1
-                            }_h=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ciudad}'`
+                            }_h=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
                           );
                         } else {
                           const valor = parseFloat(
@@ -198,7 +200,7 @@ exports.climaController = async (req, res) => {
                           await pool.query(
                             `UPDATE datos_clima SET p${
                               p + 1
-                            }_h=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ciudad}'`
+                            }_h=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
                           );
                         }
                       }
@@ -206,7 +208,7 @@ exports.climaController = async (req, res) => {
                       //Para velocidad
                       const bfechaclimaVelo = await pool.query(
                         QUERYS.buscarClimaPeriodos,
-                        [ciudad, fechaAnterior]
+                        [ucpMC, fechaAnterior]
                       );
                       if (bfechaclimaVelo == null) {
                         const valor = parseFloat(
@@ -215,7 +217,7 @@ exports.climaController = async (req, res) => {
                         await pool.query(
                           `INSERT INTO datos_clima (fecha, ucp, p${
                             p + 1
-                          }_v) VALUES ('${fechaAnterior}', '${ciudad}', ${valor})`
+                          }_v) VALUES ('${fechaAnterior}', '${ucpMC}', ${valor})`
                         );
                       } else {
                         if (p == 0) {
@@ -223,7 +225,7 @@ exports.climaController = async (req, res) => {
                             arrayHistorico[p].periodos[`p${p + 1}_v`]
                           ).toFixed(4);
                           await pool.query(
-                            `UPDATE datos_clima SET p24_v=${valor24} WHERE fecha='${fechaAnterior}' AND ucp='${ciudad}'`
+                            `UPDATE datos_clima SET p24_v=${valor24} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
                           );
 
                           const valor = parseFloat(
@@ -232,7 +234,7 @@ exports.climaController = async (req, res) => {
                           await pool.query(
                             `UPDATE datos_clima SET p${
                               p + 1
-                            }_v=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ciudad}'`
+                            }_v=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
                           );
                         } else {
                           const valor = parseFloat(
@@ -241,7 +243,7 @@ exports.climaController = async (req, res) => {
                           await pool.query(
                             `UPDATE datos_clima SET p${
                               p + 1
-                            }_v=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ciudad}'`
+                            }_v=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
                           );
                         }
                       }
@@ -249,21 +251,21 @@ exports.climaController = async (req, res) => {
                       //Para Icono
                       const bfechaclimaIcono = await pool.query(
                         QUERYS.buscarClimaPeriodos,
-                        [ciudad, fechaAnterior]
+                        [ucpMC, fechaAnterior]
                       );
                       if (bfechaclimaIcono == null) {
                         const valor = arrayHistorico[p].periodos[`p${p + 1}_i`];
                         await pool.query(
                           `INSERT INTO datos_clima (fecha, ucp, p${
                             p + 1
-                          }_i) VALUES ('${fechaAnterior}', '${ciudad}', '${valor}')`
+                          }_i) VALUES ('${fechaAnterior}', '${ucpMC}', '${valor}')`
                         );
                       } else {
                         if (p == 0) {
                           const valor24 =
                             arrayHistorico[p].periodos[`p${p + 1}_i`];
                           await pool.query(
-                            `UPDATE datos_clima SET p24_i='${valor24}' WHERE fecha='${fechaAnterior}' AND ucp='${ciudad}'`
+                            `UPDATE datos_clima SET p24_i='${valor24}' WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
                           );
 
                           const valor =
@@ -271,7 +273,7 @@ exports.climaController = async (req, res) => {
                           await pool.query(
                             `UPDATE datos_clima SET p${
                               p + 1
-                            }_i='${valor}' WHERE fecha='${fechaAnterior}' AND ucp='${ciudad}'`
+                            }_i='${valor}' WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
                           );
                         } else {
                           const valor =
@@ -279,7 +281,7 @@ exports.climaController = async (req, res) => {
                           await pool.query(
                             `UPDATE datos_clima SET p${
                               p + 1
-                            }_i='${valor}' WHERE fecha='${fechaAnterior}' AND ucp='${ciudad}'`
+                            }_i='${valor}' WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
                           );
                         }
                       }
@@ -335,6 +337,7 @@ exports.climaController = async (req, res) => {
       if (ucp.rowCount > 0) {
         let ciudadID = "";
         let ciudad = "";
+        let ucpMC = "";
         //if(true){
         for (const fila of ucp.rows) {
           switch (fila.aux2) {
@@ -342,6 +345,7 @@ exports.climaController = async (req, res) => {
             case "Antioquia":
               ciudadID = "3671950";
               ciudad = "Medellin";
+              ucpMC = fila.aux2;
               break;
           }
           if (bKeyP.rowCount > 0) {
@@ -396,12 +400,12 @@ exports.climaController = async (req, res) => {
                   //Búsqueda de cada Mercado de comercialización por fecha
                   const search = await pool.query(QUERYS.buscarFechaClima, [
                     fecha[0],
-                    ciudad,
+                    ucpMC,
                   ]);
                   if (search.rowCount > 0) {
                     //Si existe fecha se actualizan los periodos correspondientes
                     await pool.query(
-                      `UPDATE datos_clima SET p${pos}_t=${tem}, p${pos}_h=${hum}, p${pos}_v=${vel}, p${pos}_i='${ico}' WHERE fecha='${fecha[0]}' AND ucp='${ciudad}' RETURNING *`
+                      `UPDATE datos_clima SET p${pos}_t=${tem}, p${pos}_h=${hum}, p${pos}_v=${vel}, p${pos}_i='${ico}' WHERE fecha='${fecha[0]}' AND ucp='${ucpMC}' RETURNING *`
                     );
                   } else {
                     //Si no existe fecha se agregan los periodos correspondientes
@@ -418,7 +422,7 @@ exports.climaController = async (req, res) => {
                       console.log({ tem, hum, vel, ico });
 
                       await pool.query(
-                        `INSERT INTO datos_clima (fecha, ucp, p${pos}_t, p${pos}_h, p${pos}_v, p${pos}_i) VALUES ('${fecha[0]}', '${ciudad}', ${tem}, ${hum}, ${vel}, '${ico}') RETURNING *`
+                        `INSERT INTO datos_clima (fecha, ucp, p${pos}_t, p${pos}_h, p${pos}_v, p${pos}_i) VALUES ('${fecha[0]}', '${ucpMC}', ${tem}, ${hum}, ${vel}, '${ico}') RETURNING *`
                       );
                     }
                   }
@@ -427,7 +431,7 @@ exports.climaController = async (req, res) => {
                 //Rellenando los valores que hay con cero con el registro anterior: es decir p3 con dato, rellena las dos posiciones anteriores: p1 y p2
                 const buscarIconos = await pool.query(
                   QUERYS.buscarUltimasFechasClimaPronostico,
-                  [ciudad, 13]
+                  [ucpMC, 13]
                 );
                 if (buscarIconos.rowCount > 0) {
                   let k = 0;
@@ -470,7 +474,7 @@ exports.climaController = async (req, res) => {
                       ).format("YYYY-MM-DD");
                       for (j = 0; j < arrayPosFaltante.length; j++) {
                         await pool.query(
-                          `UPDATE datos_clima SET p${arrayPosFaltante[j]}_i='${valorIcono}' WHERE fecha='${fecha}' AND ucp='${ciudad}' RETURNING *`
+                          `UPDATE datos_clima SET p${arrayPosFaltante[j]}_i='${valorIcono}' WHERE fecha='${fecha}' AND ucp='${ucpMC}' RETURNING *`
                         );
                         console.log(
                           arrayPosFaltante[j],
@@ -486,7 +490,7 @@ exports.climaController = async (req, res) => {
                 //Duplica las variables climaticas de los periodos cargados por cada Mercado de Comercialización hasta llegar a 13 días
                 const row = await pool.query(
                   QUERYS.buscarUltimasFechasClimaPronostico,
-                  [ciudad, 1]
+                  [ucpMC, 1]
                 );
 
                 if (row.rowCount > 0) {
@@ -496,7 +500,7 @@ exports.climaController = async (req, res) => {
                       .format("YYYY-MM-DD");
                     const search = await pool.query(QUERYS.buscarFechaClima, [
                       diasiguiente,
-                      ciudad,
+                      ucpMC,
                     ]);
                     if (search.rowCount == 0) {
                       //Si no existe fecha se agregan los periodos correspondientes
@@ -511,7 +515,7 @@ exports.climaController = async (req, res) => {
                       );
                       if (diasiguiente <= fechaMaxima) {
                         await pool.query(
-                          `INSERT INTO datos_clima (fecha, ucp, p1_t, p1_h, p1_v, p1_i) VALUES ('${diasiguiente}', '${ciudad}', ${row.rows[0].p1_t}, ${row.rows[0].p1_h}, ${row.rows[0].p1_v}, '${row.rows[0].p1_i}')`
+                          `INSERT INTO datos_clima (fecha, ucp, p1_t, p1_h, p1_v, p1_i) VALUES ('${diasiguiente}', '${ucpMC}', ${row.rows[0].p1_t}, ${row.rows[0].p1_h}, ${row.rows[0].p1_v}, '${row.rows[0].p1_i}')`
                         );
                       }
                     }
@@ -523,7 +527,7 @@ exports.climaController = async (req, res) => {
                           row.rows[0][`p${n}_v`]
                         }, p${n}_i='${
                           row.rows[0][`p${n}_i`]
-                        }' WHERE fecha='${diasiguiente}' AND ucp='${ciudad}' RETURNING *`
+                        }' WHERE fecha='${diasiguiente}' AND ucp='${ucpMC}' RETURNING *`
                       );
                     }
                   }
@@ -707,7 +711,7 @@ exports.climaController = async (req, res) => {
                 //Se completa con ello los 12 días
                 const row2 = await pool.query(
                   QUERYS.buscarUltimasFechasClimaPronostico,
-                  [ciudad, 1]
+                  [ucpMC, 1]
                 );
                 const ultimaFecha = await pool.query(
                   `
@@ -715,12 +719,12 @@ exports.climaController = async (req, res) => {
                                     FROM public.datos_clima 
                                     WHERE ucp = $1 AND fecha < CURRENT_DATE
                                 `,
-                  [ciudad]
+                  [ucpMC]
                 );
 
                 if (row2.rowCount > 0) {
                   await rellenarDiasHastaHoy(
-                    ciudad,
+                    ucpMC,
                     ultimaFecha.rows[0]?.ultima_fecha
                   );
                   const diasiguiente = moment(row2.rows[0].fecha)
@@ -728,7 +732,7 @@ exports.climaController = async (req, res) => {
                     .format("YYYY-MM-DD");
                   const search = await pool.query(QUERYS.buscarFechaClima, [
                     diasiguiente,
-                    ciudad,
+                    ucpMC,
                   ]);
                   if (search.rowCount == 0) {
                     //Si no existe fecha se agregan los periodos correspondientes
@@ -744,7 +748,7 @@ exports.climaController = async (req, res) => {
                     );
                     if (diasiguiente <= fechaMaxima) {
                       await pool.query(
-                        `INSERT INTO datos_clima (fecha, ucp, p1_t, p1_h, p1_v, p1_i) VALUES ('${diasiguiente}', '${ciudad}', ${row2.rows[0].p1_t}, ${row2.rows[0].p1_h}, ${row2.rows[0].p1_v}, '${row2.rows[0].p1_i}')`
+                        `INSERT INTO datos_clima (fecha, ucp, p1_t, p1_h, p1_v, p1_i) VALUES ('${diasiguiente}', '${ucpMC}', ${row2.rows[0].p1_t}, ${row2.rows[0].p1_h}, ${row2.rows[0].p1_v}, '${row2.rows[0].p1_i}')`
                       );
                     }
                   }
@@ -756,7 +760,7 @@ exports.climaController = async (req, res) => {
                         row2.rows[0][`p${n}_v`]
                       }, p${n}_i='${
                         row2.rows[0][`p${n}_i`]
-                      }' WHERE fecha='${diasiguiente}' AND ucp='${ciudad}' RETURNING *`
+                      }' WHERE fecha='${diasiguiente}' AND ucp='${ucpMC}' RETURNING *`
                     );
                   }
                 }
@@ -764,7 +768,7 @@ exports.climaController = async (req, res) => {
                 //Bucamos lo ultimos 13 días agregados
                 const row3 = await pool.query(
                   QUERYS.buscarUltimasFechasClimaPronostico,
-                  [ciudad, 13]
+                  [ucpMC, 13]
                 );
                 //console.log(row3.rows, 'Bucamos lo ultimos 13 días agregados')
                 if (row3.rowCount > 0) {
@@ -795,7 +799,7 @@ exports.climaController = async (req, res) => {
                                                  WHERE fecha = '${moment(
                                                    row3.rows[k]["fecha"]
                                                  ).format("YYYY-MM-DD")}' 
-                                                 AND ucp = '${ciudad}' 
+                                                 AND ucp = '${ucpMC}' 
                                                  RETURNING *`
                       );
                     }
