@@ -1,43 +1,48 @@
-const express = require("express");
-const routes = require("./routes");
-const bodyParser = require("body-parser");
-const cors =  require("cors");
-const colors = require("colors")
-require('dotenv').config()
-const cron = require('node-cron')
-const { climaController } = require('./controllers/climaController')
+import express from "express";
+import routes from "./routes/index.js";
+import bodyParser from "body-parser";
+import cors from "cors";
+import colors from "colors";
+import dotenv from "dotenv";
+import cron from "node-cron";
+import { climaController } from "./controllers/climaController.js";
+
+dotenv.config();
 
 async function startServer() {
-    //crear el servidor
-    const app = express();
+  // Crear el servidor
+  const app = express();
 
-    //Habilito cors
-    app.use(cors());
-    app.options('*', cors());
+  // Habilitar cors
+  app.use(cors());
+  app.options("*", cors());
 
-    //habilitar bodyparser
-    app.use(bodyParser.json({limit: '200mb'}));
-    app.use(bodyParser.urlencoded({limit: '200mb', extended: true }));
+  // Habilitar bodyparser
+  app.use(bodyParser.json({ limit: "200mb" }));
+  app.use(bodyParser.urlencoded({ limit: "200mb", extended: true }));
 
-    //Rutas de la app
-    app.use("/", routes());
+  // Rutas de la app
+  app.use("/", routes());
 
-    //Cargando pgTools
-    await require('./config')
-    //puerto
-    app.listen(process.env.PORT, () => {
-        console.info(`${colors.yellow('########################################################')}
+  // Cargando pgTools
+  await import("./config/index.js");
+
+  // Puerto
+  app.listen(process.env.PORT, () => {
+    console.info(`${colors.yellow("########################################################")}
         ${colors.green(`Server ${colors.blue(process.env.PROYECT)} listening on port:`)} ${colors.blue(process.env.PORT)}  🛡️
-        ${colors.yellow('########################################################')}`);
-    });
-    //Schedule automatic of process
-    cron.schedule('00 5 * * *', () =>{
-        //All days a the 5:00AM
-        //console.log('***')
-        climaController()
-    })
+        ${colors.yellow("########################################################")}`);
+  });
+
+  // Schedule automatic process
+  cron.schedule("00 5 * * *", () => {
+    // All days at 5:00AM
+    climaController();
+  });
 }
 
 startServer()
-.then(() => console.info(colors.green('Done ✌️')))
-.catch((error) => console.error(colors.red('error when starting the api'), error))
+  .then(() => console.info(colors.green("Done ✌️")))
+  .catch((error) =>
+    console.error(colors.red("error when starting the api"), error),
+  );

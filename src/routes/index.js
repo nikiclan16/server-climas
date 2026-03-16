@@ -1,9 +1,10 @@
-const express = require("express");
-const apiRouter = require('../api/routes/v1/')
+import express from "express";
+import apiRouter from "../api/routes/v1/index.js";
+
 const router = express.Router();
 
-module.exports = function () {
-    router.get("/", (req, res)=> res.json({status: "ok"}));
-    router.use("/api/v1/",  apiRouter());
-    return router;
-};
+export default function () {
+  router.get("/", (req, res) => res.json({ status: "ok" }));
+  router.use("/api/v1/", apiRouter());
+  return router;
+}
