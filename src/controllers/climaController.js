@@ -1,866 +1,555 @@
-const { Query } = require("pg");
-const pool = require("../config");
-const { QUERYS } = require("../querys");
-const fetch = (...args) =>
-  import("node-fetch").then(({ default: fetch }) => fetch(...args));
-//const HttpProxyAgent = require("http-proxy-agent");
-const moment = require("moment");
-const { saveLog } = require("../helpers/index");
+import fetch from "node-fetch";
+import moment from "moment";
+import { saveLog } from "../helpers/index.js";
+import { QUERYS } from "../querys/index.js";
+import pool from "../config/index.js";
+import { createConectionPG } from "../helpers/connections.js";
+import MercadosService from "../services/mercados.service.js";
 
-exports.climaController = async (req, res) => {
-  try {
-    //const proxyAgent = new HttpProxyAgent.HttpProxyAgent(process.env.URL_PROXY);
-    //Validamos que la fecha anterior a la fecha actual este registrada, si no lo está consume la API con los días correspondientes
-    const diaAnterior = moment().add(-1, "day").format("YYYY-MM-DD");
-    const buscarConsumoAPI2 = await pool.query(
-      QUERYS.buscarUltimaFechaClimaLog,
-      [diaAnterior]
+const mercadosService = MercadosService.getInstance();
+
+// ─── Helper: ejecutar query en ambas DBs en paralelo ─────────────────────────
+/**
+ * Ejecuta la misma query en jano_proxy (pool) y en la DB de la empresa (clientEmpresa).
+ * Si falla en la empresa solo loguea el error, nunca interrumpe el flujo principal.
+ * Siempre retorna el resultado de jano_proxy.
+ */
+const queryDual = async (clientEmpresa, sql, params = []) => {
+  const results = await Promise.allSettled([
+    params.length ? pool.query(sql, params) : pool.query(sql),
+    params.length ? clientEmpresa.query(sql, params) : clientEmpresa.query(sql),
+  ]);
+
+  if (results[1].status === "rejected") {
+    saveLog(
+      `${moment().format("DD-MM-YYYY HH:mm:ss")} => [EMPRESA] Error en query dual: ${results[1].reason?.message} | SQL: ${sql.slice(0, 120)}\n`,
     );
-    if (buscarConsumoAPI2.rowCount == 0) {
-      //if(true){
-      let totaldias = 0;
-      //Tenemos en cuenta la ultima fecha para cargar la o las fecha faltantes hasta el día anterior
-      const buscarConsumoAPI = await pool.query(QUERYS.buscarUltimaFechaClima);
-      if (buscarConsumoAPI.rowCount > 0) {
-        const fechaActual = new Date().getTime();
-        const fechaBuscada = new Date(buscarConsumoAPI.rows[0].fecha).getTime();
-        totaldias = parseInt(
-          (fechaActual - fechaBuscada) / (1000 * 60 * 60 * 24)
+  }
+
+  if (results[0].status === "rejected") throw results[0].reason;
+  return results[0].value;
+};
+
+// ─── Helpers locales ─────────────────────────────────────────────────────────
+
+const rellenarPeriodos = (dataClima) => {
+  let ultimaTemp = null;
+  let ultimaHum = null;
+  let ultimaVel = null;
+  let ultimaIco = 0;
+
+  for (let i = 1; i <= 24; i++) {
+    if (dataClima[`p${i}_t`] === null && ultimaTemp !== null)
+      dataClima[`p${i}_t`] = ultimaTemp;
+    else if (dataClima[`p${i}_t`] !== null) ultimaTemp = dataClima[`p${i}_t`];
+
+    if (dataClima[`p${i}_h`] === null && ultimaHum !== null)
+      dataClima[`p${i}_h`] = ultimaHum;
+    else if (dataClima[`p${i}_h`] !== null) ultimaHum = dataClima[`p${i}_h`];
+
+    if (dataClima[`p${i}_v`] === null && ultimaVel !== null)
+      dataClima[`p${i}_v`] = ultimaVel;
+    else if (dataClima[`p${i}_v`] !== null) ultimaVel = dataClima[`p${i}_v`];
+
+    if (dataClima[`p${i}_i`] === 0 && ultimaIco !== 0)
+      dataClima[`p${i}_i`] = ultimaIco;
+    else if (dataClima[`p${i}_i`] !== 0) ultimaIco = dataClima[`p${i}_i`];
+  }
+
+  let primerTemp = null,
+    primerHum = null,
+    primerVel = null;
+  for (let i = 1; i <= 24; i++) {
+    if (primerTemp === null && dataClima[`p${i}_t`] !== null)
+      primerTemp = dataClima[`p${i}_t`];
+    if (primerHum === null && dataClima[`p${i}_h`] !== null)
+      primerHum = dataClima[`p${i}_h`];
+    if (primerVel === null && dataClima[`p${i}_v`] !== null)
+      primerVel = dataClima[`p${i}_v`];
+  }
+  for (let i = 1; i <= 24; i++) {
+    if (dataClima[`p${i}_t`] === null && primerTemp !== null)
+      dataClima[`p${i}_t`] = primerTemp;
+    if (dataClima[`p${i}_h`] === null && primerHum !== null)
+      dataClima[`p${i}_h`] = primerHum;
+    if (dataClima[`p${i}_v`] === null && primerVel !== null)
+      dataClima[`p${i}_v`] = primerVel;
+  }
+
+  return dataClima;
+};
+
+const rellenarDiasHastaHoy = async (ucpMC, ultimaFecha, clientEmpresa) => {
+  const fechaActual = moment().format("YYYY-MM-DD");
+  let fechaIterar = moment(ultimaFecha);
+
+  saveLog(
+    `${moment().format("DD-MM-YYYY HH:mm:ss")} => Iniciando relleno desde ${ultimaFecha} hasta ${fechaActual} para ${ucpMC}\n`,
+  );
+
+  while (fechaIterar.isBefore(fechaActual)) {
+    fechaIterar.add(1, "days");
+    const fechaNueva = fechaIterar.format("YYYY-MM-DD");
+
+    const search = await pool.query(QUERYS.buscarFechaClima, [
+      fechaNueva,
+      ucpMC,
+    ]);
+    if (search.rowCount === 0) {
+      const ultimoDia = await pool.query(
+        QUERYS.buscarUltimasFechasClimaPronostico,
+        [ucpMC, 1],
+      );
+      let dataClima = rellenarPeriodos(ultimoDia.rows[0]);
+
+      await queryDual(
+        clientEmpresa,
+        `INSERT INTO datos_clima (fecha, ucp, p1_t, p1_h, p1_v, p1_i) VALUES ('${fechaNueva}', '${ucpMC}', ${dataClima.p1_t}, ${dataClima.p1_h}, ${dataClima.p1_v}, '${dataClima.p1_i}')`,
+      );
+      for (let n = 2; n <= 24; n++) {
+        await queryDual(
+          clientEmpresa,
+          `UPDATE datos_clima SET p${n}_t=${dataClima[`p${n}_t`]}, p${n}_h=${dataClima[`p${n}_h`]}, p${n}_v=${dataClima[`p${n}_v`]}, p${n}_i='${dataClima[`p${n}_i`]}' WHERE fecha='${fechaNueva}' AND ucp='${ucpMC}'`,
         );
       }
-      const ucp = await pool.query(QUERYS.cargarUCP, ["2", "1"]);
+      saveLog(
+        `${moment().format("DD-MM-YYYY HH:mm:ss")} => Día añadido: ${fechaNueva} para ${ucpMC}\n`,
+      );
+    }
+  }
+};
 
-      //INICIO DE HISTÓRICO
-      if (totaldias > 0) {
-        let ciudadID = "";
-        let ciudad = "";
-        let ucpMC = "";
-        //Busca la key de la API
-        const bKeyH = await pool.query(QUERYS.buscarKey, [15]);
-        if (ucp.rowCount > 0) {
-          //if(true){
-          for (const fila of ucp.rows) {
-            switch (fila.aux2) {
-              //switch ("Antioquia"){
-              case "Antioquia":
-                ciudadID = "107060";
-                ciudad = "Medellin";
-                ucpMC = fila.aux2;
-                break;
-            }
-            if (bKeyH.rowCount > 0) {
-              if (ciudadID != "") {
-                const apiHistorico = `http://dataservice.accuweather.com/currentconditions/v1/${ciudadID}/historical/24?apikey=${bKeyH.rows[0].aux}&language=es&details=true`;
-                const responseHistorico = await fetch(apiHistorico);
-                const dataHistorico = await responseHistorico.json();
-                //console.log(JSON.stringify(dataHistorico), "dataHistorico"); // Outputs the fetched data
+// ─── Procesador por mercado ───────────────────────────────────────────────────
+const procesarMercado = async (
+  clientEmpresa,
+  ucpMC,
+  ciudadID_hist,
+  ciudadID_pron,
+  ciudad,
+  keyHist,
+  keyPron,
+  totaldias,
+) => {
+  const log = (msg) =>
+    saveLog(`${moment().format("DD-MM-YYYY HH:mm:ss")} => ${msg}\n`);
 
-                saveLog(
-                  `${moment().format(
-                    "DD-MM-YYYY HH:mm:ss"
-                  )} => Se inició el proceso para Históstico correctamente para ${ciudad}\n`
-                );
-                //Armamos el proceso de almacenamiento en el array
-                let arrayHistorico = [];
-                let i = 1;
-                if (dataHistorico.length > 0) {
-                  for (dataH of dataHistorico) {
-                    let periodos = {};
-                    const dateSplit =
-                      dataH.LocalObservationDateTime.split("T")[0];
-                    let indexT = `p${i}_t`;
-                    let indexH = `p${i}_h`;
-                    let indexV = `p${i}_v`;
-                    let indexI = `p${i}_i`;
+  // ── HISTÓRICO ──────────────────────────────────────────────────────────────
+  if (totaldias > 0 && ciudadID_hist && keyHist) {
+    try {
+      log(`Iniciando Histórico para ${ciudad}`);
+      const apiHistorico = `http://dataservice.accuweather.com/currentconditions/v1/${ciudadID_hist}/historical/24?apikey=${keyHist}&language=es&details=true`;
+      const responseHistorico = await fetch(apiHistorico);
+      const dataHistorico = await responseHistorico.json();
 
-                    const temperatura = dataH.Temperature.Metric.Value;
-                    const potencia =
-                      13.12 +
-                      0.6215 * parseFloat(temperatura) -
-                      11.37 *
-                        Math.pow(
-                          parseFloat(dataH.Wind.Speed.Metric.Value),
-                          0.16
-                        ) +
-                      0.3965 *
-                        parseFloat(temperatura) *
-                        Math.pow(
-                          parseFloat(dataH.Wind.Speed.Metric.Value),
-                          0.16
-                        );
+      if (dataHistorico.length > 0) {
+        let arrayHistorico = [];
+        let i = 1;
+        for (const dataH of dataHistorico) {
+          const temperatura = dataH.Temperature.Metric.Value;
+          const potencia =
+            13.12 +
+            0.6215 * parseFloat(temperatura) -
+            11.37 * Math.pow(parseFloat(dataH.Wind.Speed.Metric.Value), 0.16) +
+            0.3965 *
+              parseFloat(temperatura) *
+              Math.pow(parseFloat(dataH.Wind.Speed.Metric.Value), 0.16);
 
-                    (periodos[indexT] = potencia),
-                      (periodos[indexH] = dataH.RelativeHumidity),
-                      (periodos[indexV] = dataH.Wind.Speed.Metric.Value);
-                    periodos[indexI] = dataH.WeatherIcon;
-                    arrayHistorico.push({
-                      date: dateSplit,
-                      periodos,
-                    });
-                    i++;
-                  }
-                  //console.log(arrayHistorico, "arrayHistorico")
-                  for (let j = 0; j < 1; j++) {
-                    const fechaAnterior = moment()
-                      .add(j - 1, "day")
-                      .format("YYYY-MM-DD");
-                    //Recorremos los 24 periodos
-                    for (let p = 0; p < 23; p++) {
-                      //Para temperatura
-                      const bfechaclimaTemp = await pool.query(
-                        QUERYS.buscarClimaPeriodos,
-                        [ucpMC, fechaAnterior]
-                      );
-                      if (bfechaclimaTemp.rowCount == 0) {
-                        if (p == 0) {
-                          await pool.query(QUERYS.agregarClimaPronosticoLog, [
-                            fechaAnterior,
-                            ucpMC,
-                          ]); //Guardamos el log de las fechas registradas
-                          const valor24 = parseFloat(
-                            arrayHistorico[23].periodos[`p24_t`]
-                          ).toFixed(4);
-                          await pool.query(
-                            `INSERT INTO datos_clima (fecha, ucp, p24_t) VALUES ('${fechaAnterior}', '${ucpMC}', ${valor24})`
-                          );
+          arrayHistorico.push({
+            periodos: {
+              [`p${i}_t`]: potencia,
+              [`p${i}_h`]: dataH.RelativeHumidity,
+              [`p${i}_v`]: dataH.Wind.Speed.Metric.Value,
+              [`p${i}_i`]: dataH.WeatherIcon,
+            },
+          });
+          i++;
+        }
 
-                          const valor = parseFloat(
-                            arrayHistorico[p].periodos[`p${p + 1}_t`]
-                          ).toFixed(4);
-                          await pool.query(
-                            `UPDATE datos_clima SET p${
-                              p + 1
-                            }_t=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
-                          );
-                        } else {
-                          const valor = parseFloat(
-                            arrayHistorico[p].periodos[`p${p + 1}_t`]
-                          ).toFixed(4);
-                          await pool.query(
-                            `INSERT INTO datos_clima (fecha, ucp, p${
-                              p + 1
-                            }_t) VALUES ('${fechaAnterior}', '${ucpMC}', ${valor})`
-                          );
-                        }
-                      } else {
-                        if (p == 0) {
-                          const valor = parseFloat(
-                            arrayHistorico[p].periodos[`p${p + 1}_t`]
-                          ).toFixed(4);
-                          await pool.query(
-                            `UPDATE datos_clima SET p24_t=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
-                          );
-                        } else {
-                          const valor = parseFloat(
-                            arrayHistorico[p].periodos[`p${p + 1}_t`]
-                          ).toFixed(4);
-                          await pool.query(
-                            `UPDATE datos_clima SET p${
-                              p + 1
-                            }_t=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
-                          );
-                        }
-                      }
+        const fechaAnterior = moment().add(-1, "day").format("YYYY-MM-DD");
 
-                      //Para humedad
-                      const bfechaclimaHume = await pool.query(
-                        QUERYS.buscarClimaPeriodos,
-                        [ucpMC, fechaAnterior]
-                      );
-                      if (bfechaclimaHume == null) {
-                        const valor = parseFloat(
-                          arrayHistorico[p].periodos[`p${p + 1}_h`]
-                        ).toFixed(4);
-                        await pool.query(
-                          `INSERT INTO datos_clima (fecha, ucp, p${
-                            p + 1
-                          }_h) VALUES ('${fechaAnterior}', '${ucpMC}', ${valor})`
-                        );
-                      } else {
-                        if (p == 0) {
-                          const valor24 = parseFloat(
-                            arrayHistorico[p].periodos[`p${p + 1}_h`]
-                          ).toFixed(4);
-                          await pool.query(
-                            `UPDATE datos_clima SET p24_h=${valor24} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
-                          );
+        for (let p = 0; p < 23; p++) {
+          // Lectura solo desde jano_proxy como fuente de verdad
+          const bfecha = await pool.query(QUERYS.buscarClimaPeriodos, [
+            ucpMC,
+            fechaAnterior,
+          ]);
 
-                          const valor = parseFloat(
-                            arrayHistorico[p].periodos[`p${p + 1}_h`]
-                          ).toFixed(4);
-                          await pool.query(
-                            `UPDATE datos_clima SET p${
-                              p + 1
-                            }_h=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
-                          );
-                        } else {
-                          const valor = parseFloat(
-                            arrayHistorico[p].periodos[`p${p + 1}_h`]
-                          ).toFixed(4);
-                          await pool.query(
-                            `UPDATE datos_clima SET p${
-                              p + 1
-                            }_h=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
-                          );
-                        }
-                      }
-
-                      //Para velocidad
-                      const bfechaclimaVelo = await pool.query(
-                        QUERYS.buscarClimaPeriodos,
-                        [ucpMC, fechaAnterior]
-                      );
-                      if (bfechaclimaVelo == null) {
-                        const valor = parseFloat(
-                          arrayHistorico[p].periodos[`p${p + 1}_v`]
-                        ).toFixed(4);
-                        await pool.query(
-                          `INSERT INTO datos_clima (fecha, ucp, p${
-                            p + 1
-                          }_v) VALUES ('${fechaAnterior}', '${ucpMC}', ${valor})`
-                        );
-                      } else {
-                        if (p == 0) {
-                          const valor24 = parseFloat(
-                            arrayHistorico[p].periodos[`p${p + 1}_v`]
-                          ).toFixed(4);
-                          await pool.query(
-                            `UPDATE datos_clima SET p24_v=${valor24} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
-                          );
-
-                          const valor = parseFloat(
-                            arrayHistorico[p].periodos[`p${p + 1}_v`]
-                          ).toFixed(4);
-                          await pool.query(
-                            `UPDATE datos_clima SET p${
-                              p + 1
-                            }_v=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
-                          );
-                        } else {
-                          const valor = parseFloat(
-                            arrayHistorico[p].periodos[`p${p + 1}_v`]
-                          ).toFixed(4);
-                          await pool.query(
-                            `UPDATE datos_clima SET p${
-                              p + 1
-                            }_v=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
-                          );
-                        }
-                      }
-
-                      //Para Icono
-                      const bfechaclimaIcono = await pool.query(
-                        QUERYS.buscarClimaPeriodos,
-                        [ucpMC, fechaAnterior]
-                      );
-                      if (bfechaclimaIcono == null) {
-                        const valor = arrayHistorico[p].periodos[`p${p + 1}_i`];
-                        await pool.query(
-                          `INSERT INTO datos_clima (fecha, ucp, p${
-                            p + 1
-                          }_i) VALUES ('${fechaAnterior}', '${ucpMC}', '${valor}')`
-                        );
-                      } else {
-                        if (p == 0) {
-                          const valor24 =
-                            arrayHistorico[p].periodos[`p${p + 1}_i`];
-                          await pool.query(
-                            `UPDATE datos_clima SET p24_i='${valor24}' WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
-                          );
-
-                          const valor =
-                            arrayHistorico[p].periodos[`p${p + 1}_i`];
-                          await pool.query(
-                            `UPDATE datos_clima SET p${
-                              p + 1
-                            }_i='${valor}' WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
-                          );
-                        } else {
-                          const valor =
-                            arrayHistorico[p].periodos[`p${p + 1}_i`];
-                          await pool.query(
-                            `UPDATE datos_clima SET p${
-                              p + 1
-                            }_i='${valor}' WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`
-                          );
-                        }
-                      }
-                    }
-                  }
-                  saveLog(
-                    `${moment().format(
-                      "DD-MM-YYYY HH:mm:ss"
-                    )} => Se culminó el proceso para Históstico correctamente para ${ciudad}\n`
-                  );
-                } else {
-                  console.log("No se encuentró datos de Históricos en la URL");
-                  saveLog(
-                    `${moment().format(
-                      "DD-MM-YYYY HH:mm:ss"
-                    )} => No se encuentró datos de Históricos en la URL ${apiHistorico}\n`
-                  );
-                }
-              } else {
-                console.log(
-                  `El MC ${fila.aux2} de la BD no se encuentra en el Switch Case`
-                );
-                saveLog(
-                  `${moment().format("DD-MM-YYYY HH:mm:ss")} => El MC ${
-                    fila.aux2
-                  } de la BD no se encuentra en el Switch Case\n`
-                );
-              }
-            } else {
-              console.log("No se encuentró la Key para Histórico");
-              saveLog(
-                `${moment().format(
-                  "DD-MM-YYYY HH:mm:ss"
-                )} => No se encuentró la Key para Histórico\n`
+          if (bfecha.rowCount === 0) {
+            if (p === 0) {
+              // Log dual (datos_climalog también se replica)
+              await queryDual(clientEmpresa, QUERYS.agregarClimaPronosticoLog, [
+                fechaAnterior,
+                ucpMC,
+              ]);
+              const valor24 = parseFloat(
+                arrayHistorico[23].periodos[`p24_t`],
+              ).toFixed(4);
+              await queryDual(
+                clientEmpresa,
+                `INSERT INTO datos_clima (fecha, ucp, p24_t) VALUES ('${fechaAnterior}', '${ucpMC}', ${valor24})`,
               );
             }
+            const valor = parseFloat(
+              arrayHistorico[p].periodos[`p${p + 1}_t`],
+            ).toFixed(4);
+            await queryDual(
+              clientEmpresa,
+              `UPDATE datos_clima SET p${p + 1}_t=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`,
+            );
+          } else {
+            const campoRef = p === 0 ? "p24_t" : `p${p + 1}_t`;
+            const valor = parseFloat(
+              arrayHistorico[p].periodos[`p${p + 1}_t`],
+            ).toFixed(4);
+            await queryDual(
+              clientEmpresa,
+              `UPDATE datos_clima SET ${campoRef}=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`,
+            );
           }
-        } else {
-          console.log("No se encuentró Mercados registrados para Histórico");
-          saveLog(
-            `${moment().format(
-              "DD-MM-YYYY HH:mm:ss"
-            )} => No se encuentró Mercados registrados para Histórico\n`
+
+          const valor_h = parseFloat(
+            arrayHistorico[p].periodos[`p${p + 1}_h`],
+          ).toFixed(4);
+          if (p === 0)
+            await queryDual(
+              clientEmpresa,
+              `UPDATE datos_clima SET p24_h=${valor_h} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`,
+            );
+          await queryDual(
+            clientEmpresa,
+            `UPDATE datos_clima SET p${p + 1}_h=${valor_h} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`,
+          );
+
+          const valor_v = parseFloat(
+            arrayHistorico[p].periodos[`p${p + 1}_v`],
+          ).toFixed(4);
+          if (p === 0)
+            await queryDual(
+              clientEmpresa,
+              `UPDATE datos_clima SET p24_v=${valor_v} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`,
+            );
+          await queryDual(
+            clientEmpresa,
+            `UPDATE datos_clima SET p${p + 1}_v=${valor_v} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`,
+          );
+
+          const valor_i = arrayHistorico[p].periodos[`p${p + 1}_i`];
+          if (p === 0)
+            await queryDual(
+              clientEmpresa,
+              `UPDATE datos_clima SET p24_i='${valor_i}' WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`,
+            );
+          await queryDual(
+            clientEmpresa,
+            `UPDATE datos_clima SET p${p + 1}_i='${valor_i}' WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`,
           );
         }
+
+        log(`Histórico completado para ${ciudad}`);
       } else {
-        console.log("Total días 0");
+        log(`Sin datos históricos en la URL para ${ciudad}`);
       }
-      //FIN DE HISTÓRICO
-      console.log("***** INICIO DE PRONÓSTICO *****");
-      //INICIO DE PRONÓSTICO
-      const bKeyP = await pool.query(QUERYS.buscarKey, [12]);
-      if (ucp.rowCount > 0) {
-        let ciudadID = "";
-        let ciudad = "";
-        let ucpMC = "";
-        //if(true){
-        for (const fila of ucp.rows) {
-          switch (fila.aux2) {
-            //switch ("Antioquia"){
-            case "Antioquia":
-              ciudadID = "3671950";
-              ciudad = "Medellin";
-              ucpMC = fila.aux2;
-              break;
-          }
-          if (bKeyP.rowCount > 0) {
-            if (ciudadID != "") {
-              const apiPronostico = `http://api.openweathermap.org/data/2.5/forecast?id=${ciudadID}&APPID=${bKeyP.rows[0].aux}&units=metric`;
-              const responsePronostico = await fetch(apiPronostico);
-              const dataPronostico = await responsePronostico.json();
-              //console.log(JSON.stringify(dataPronostico), "dataPronostico"); // Outputs the fetched data
+    } catch (err) {
+      log(`Error en Histórico para ${ciudad}: ${err.message}`);
+    }
+  }
 
-              saveLog(
-                `${moment().format(
-                  "DD-MM-YYYY HH:mm:ss"
-                )} => Se inició el proceso para Pronóstico correctamente para ${ciudad}\n`
-              );
+  // ── PRONÓSTICO ─────────────────────────────────────────────────────────────
+  if (!ciudadID_pron || !keyPron) return;
 
-              if (
-                dataPronostico.cod == 200 &&
-                dataPronostico.list != undefined &&
-                dataPronostico.list.length > 0
-              ) {
-                for (const dataP of dataPronostico.list) {
-                  const fecha = dataP.dt_txt.split(" ");
-                  const hora = fecha[1].split(":");
+  try {
+    log(`Iniciando Pronóstico para ${ciudad}`);
+    const apiPronostico = `http://api.openweathermap.org/data/2.5/forecast?id=${ciudadID_pron}&APPID=${keyPron}&units=metric`;
+    const responsePronostico = await fetch(apiPronostico);
+    const dataPronostico = await responsePronostico.json();
 
-                  //Validando las horas (periodos)
-                  let pos = 0;
-                  switch (hora[0]) {
-                    case "00":
-                      pos = 24;
-                      break;
-                    case "10":
-                      pos = 10;
-                      break;
-                    case "20":
-                      pos = 20;
-                      break;
-                    default:
-                      pos = hora[0].replace("0", "");
-                      break;
-                  }
-                  //Declaración de variables climáticas
-                  const tem = dataP.main.temp;
-                  const hum = dataP.main.humidity;
-                  const vel = dataP.wind.speed;
-                  const ico = dataP.weather[0].id; // 👈 FIX
+    if (dataPronostico.cod == 200 && dataPronostico.list?.length > 0) {
+      for (const dataP of dataPronostico.list) {
+        const fecha = dataP.dt_txt.split(" ");
+        const hora = fecha[1].split(":");
+        let pos = 0;
+        switch (hora[0]) {
+          case "00":
+            pos = 24;
+            break;
+          case "10":
+            pos = 10;
+            break;
+          case "20":
+            pos = 20;
+            break;
+          default:
+            pos = parseInt(hora[0]);
+            break;
+        }
+        const tem = dataP.main.temp;
+        const hum = dataP.main.humidity;
+        const vel = dataP.wind.speed;
+        const ico = dataP.weather[0].id;
 
-                  console.log(ciudad, "<<=ciudad");
-                  console.log(ico, "<<=ico");
-                  console.log(pos, "pos");
-                  console.log("******");
-
-                  //Búsqueda de cada Mercado de comercialización por fecha
-                  const search = await pool.query(QUERYS.buscarFechaClima, [
-                    fecha[0],
-                    ucpMC,
-                  ]);
-                  if (search.rowCount > 0) {
-                    //Si existe fecha se actualizan los periodos correspondientes
-                    await pool.query(
-                      `UPDATE datos_clima SET p${pos}_t=${tem}, p${pos}_h=${hum}, p${pos}_v=${vel}, p${pos}_i='${ico}' WHERE fecha='${fecha[0]}' AND ucp='${ucpMC}' RETURNING *`
-                    );
-                  } else {
-                    //Si no existe fecha se agregan los periodos correspondientes
-                    const fechaMaxima = moment()
-                      .add(12, "days")
-                      .format("YYYY-MM-DD");
-                    console.log(
-                      "fecha punto 1:",
-                      fecha,
-                      "fecha Maxima:",
-                      fechaMaxima
-                    );
-                    if (fecha[0] <= fechaMaxima) {
-                      console.log({ tem, hum, vel, ico });
-
-                      await pool.query(
-                        `INSERT INTO datos_clima (fecha, ucp, p${pos}_t, p${pos}_h, p${pos}_v, p${pos}_i) VALUES ('${fecha[0]}', '${ucpMC}', ${tem}, ${hum}, ${vel}, '${ico}') RETURNING *`
-                      );
-                    }
-                  }
-                } //Este proceso finaliza ingresando los datos de cada mercado en 3, 6, 9, 12, 15, 18, 24 periodos por cada clima
-
-                //Rellenando los valores que hay con cero con el registro anterior: es decir p3 con dato, rellena las dos posiciones anteriores: p1 y p2
-                const buscarIconos = await pool.query(
-                  QUERYS.buscarUltimasFechasClimaPronostico,
-                  [ucpMC, 13]
-                );
-                if (buscarIconos.rowCount > 0) {
-                  let k = 0;
-                  const periodosConDatos = [3, 6, 9, 12, 15, 18, 21, 24];
-                  while (k < buscarIconos.rowCount) {
-                    //Recorremos las posiciones que tienen datos
-                    let l = 0;
-                    while (l < periodosConDatos.length) {
-                      const posicionConValor = periodosConDatos[l];
-                      switch (posicionConValor) {
-                        case 3:
-                          arrayPosFaltante = [1, 2];
-                          break;
-                        case 6:
-                          arrayPosFaltante = [4, 5];
-                          break;
-                        case 9:
-                          arrayPosFaltante = [7, 8];
-                          break;
-                        case 12:
-                          arrayPosFaltante = [10, 11];
-                          break;
-                        case 15:
-                          arrayPosFaltante = [13, 14];
-                          break;
-                        case 18:
-                          arrayPosFaltante = [16, 17];
-                          break;
-                        case 21:
-                          arrayPosFaltante = [19, 20];
-                          break;
-                        case 24:
-                          arrayPosFaltante = [22, 23];
-                          break;
-                      }
-                      const valorIcono =
-                        buscarIconos.rows[k][`p${posicionConValor}_i`];
-                      const fecha = moment(
-                        buscarIconos.rows[k][`fecha`]
-                      ).format("YYYY-MM-DD");
-                      for (j = 0; j < arrayPosFaltante.length; j++) {
-                        await pool.query(
-                          `UPDATE datos_clima SET p${arrayPosFaltante[j]}_i='${valorIcono}' WHERE fecha='${fecha}' AND ucp='${ucpMC}' RETURNING *`
-                        );
-                        console.log(
-                          arrayPosFaltante[j],
-                          "posición del periodo icono"
-                        );
-                      }
-                      l++;
-                    }
-                    k++;
-                  }
-                }
-
-                //Duplica las variables climaticas de los periodos cargados por cada Mercado de Comercialización hasta llegar a 13 días
-                const row = await pool.query(
-                  QUERYS.buscarUltimasFechasClimaPronostico,
-                  [ucpMC, 1]
-                );
-
-                if (row.rowCount > 0) {
-                  for (let i = 0; i < 7; i++) {
-                    const diasiguiente = moment(row.rows[0].fecha)
-                      .add(i, "days")
-                      .format("YYYY-MM-DD");
-                    const search = await pool.query(QUERYS.buscarFechaClima, [
-                      diasiguiente,
-                      ucpMC,
-                    ]);
-                    if (search.rowCount == 0) {
-                      //Si no existe fecha se agregan los periodos correspondientes
-                      const fechaMaxima = moment()
-                        .add(12, "days")
-                        .format("YYYY-MM-DD");
-                      console.log(
-                        "fecha punto 2:",
-                        diasiguiente,
-                        "fecha Maxima:",
-                        fechaMaxima
-                      );
-                      if (diasiguiente <= fechaMaxima) {
-                        await pool.query(
-                          `INSERT INTO datos_clima (fecha, ucp, p1_t, p1_h, p1_v, p1_i) VALUES ('${diasiguiente}', '${ucpMC}', ${row.rows[0].p1_t}, ${row.rows[0].p1_h}, ${row.rows[0].p1_v}, '${row.rows[0].p1_i}')`
-                        );
-                      }
-                    }
-                    for (let n = 2; n <= 24; n++) {
-                      await pool.query(
-                        `UPDATE datos_clima SET p${n}_t=${
-                          row.rows[0][`p${n}_t`]
-                        }, p${n}_h=${row.rows[0][`p${n}_t`]}, p${n}_v=${
-                          row.rows[0][`p${n}_v`]
-                        }, p${n}_i='${
-                          row.rows[0][`p${n}_i`]
-                        }' WHERE fecha='${diasiguiente}' AND ucp='${ucpMC}' RETURNING *`
-                      );
-                    }
-                  }
-                }
-
-                // Función para rellenar los periodos vacíos con el siguiente valor disponible
-                const rellenarPeriodos = (dataClima) => {
-                  let ultimaTemp = null;
-                  let ultimaHum = null;
-                  let ultimaVel = null;
-                  let ultimaIco = 0;
-
-                  // Primero recorrer hacia adelante para rellenar con el último valor disponible
-                  for (let i = 1; i <= 24; i++) {
-                    // Temperatura
-                    if (dataClima[`p${i}_t`] === null && ultimaTemp !== null) {
-                      dataClima[`p${i}_t`] = ultimaTemp;
-                    } else if (dataClima[`p${i}_t`] !== null) {
-                      ultimaTemp = dataClima[`p${i}_t`];
-                    }
-
-                    // Humedad
-                    if (dataClima[`p${i}_h`] === null && ultimaHum !== null) {
-                      dataClima[`p${i}_h`] = ultimaHum;
-                    } else if (dataClima[`p${i}_h`] !== null) {
-                      ultimaHum = dataClima[`p${i}_h`];
-                    }
-
-                    // Velocidad del viento
-                    if (dataClima[`p${i}_v`] === null && ultimaVel !== null) {
-                      dataClima[`p${i}_v`] = ultimaVel;
-                    } else if (dataClima[`p${i}_v`] !== null) {
-                      ultimaVel = dataClima[`p${i}_v`];
-                    }
-
-                    // Icono
-                    if (dataClima[`p${i}_i`] === 0 && ultimaIco !== 0) {
-                      dataClima[`p${i}_i`] = ultimaIco;
-                    } else if (dataClima[`p${i}_i`] !== 0) {
-                      ultimaIco = dataClima[`p${i}_i`];
-                    }
-                  }
-
-                  // Ahora rellenar hacia atrás en caso de que los primeros valores (p1, p2, etc.) sean nulos
-                  let primerValorTemp = null;
-                  let primerValorHum = null;
-                  let primerValorVel = null;
-
-                  // Buscar el primer valor no nulo para cada variable
-                  for (let i = 1; i <= 24; i++) {
-                    if (
-                      primerValorTemp === null &&
-                      dataClima[`p${i}_t`] !== null
-                    ) {
-                      primerValorTemp = dataClima[`p${i}_t`];
-                    }
-                    if (
-                      primerValorHum === null &&
-                      dataClima[`p${i}_h`] !== null
-                    ) {
-                      primerValorHum = dataClima[`p${i}_h`];
-                    }
-                    if (
-                      primerValorVel === null &&
-                      dataClima[`p${i}_v`] !== null
-                    ) {
-                      primerValorVel = dataClima[`p${i}_v`];
-                    }
-                  }
-
-                  // Rellenar hacia atrás si los primeros periodos están vacíos
-                  for (let i = 1; i <= 24; i++) {
-                    if (
-                      dataClima[`p${i}_t`] === null &&
-                      primerValorTemp !== null
-                    ) {
-                      dataClima[`p${i}_t`] = primerValorTemp;
-                    }
-                    if (
-                      dataClima[`p${i}_h`] === null &&
-                      primerValorHum !== null
-                    ) {
-                      dataClima[`p${i}_h`] = primerValorHum;
-                    }
-                    if (
-                      dataClima[`p${i}_v`] === null &&
-                      primerValorVel !== null
-                    ) {
-                      dataClima[`p${i}_v`] = primerValorVel;
-                    }
-                  }
-
-                  return dataClima;
-                };
-
-                // Función para rellenar los días hasta la fecha actual con logging
-                const rellenarDiasHastaHoy = async (ciudad, ultimaFecha) => {
-                  const fechaActual = moment().format("YYYY-MM-DD");
-                  let fechaIterar = moment(ultimaFecha);
-
-                  console.log(
-                    `Iniciando relleno de días desde ${ultimaFecha} hasta la fecha actual (${fechaActual}) para la ciudad ${ciudad}`
-                  );
-                  saveLog(
-                    `${moment().format(
-                      "DD-MM-YYYY HH:mm:ss"
-                    )} => Iniciando relleno de días desde ${ultimaFecha} hasta la fecha actual (${fechaActual}) para la ciudad ${ciudad}\n`
-                  );
-
-                  while (fechaIterar.isBefore(fechaActual)) {
-                    fechaIterar.add(1, "days");
-                    const fechaNueva = fechaIterar.format("YYYY-MM-DD");
-
-                    const search = await pool.query(QUERYS.buscarFechaClima, [
-                      fechaNueva,
-                      ciudad,
-                    ]);
-
-                    if (search.rowCount == 0) {
-                      // Obtener los datos del último día registrado
-                      const ultimoDiaRegistrado = await pool.query(
-                        QUERYS.buscarUltimasFechasClimaPronostico,
-                        [ciudad, 1]
-                      );
-                      let dataClima = ultimoDiaRegistrado.rows[0];
-
-                      // Aplicar la función rellenarPeriodos
-                      dataClima = rellenarPeriodos(dataClima);
-
-                      // Insertar el nuevo día con los datos rellenados
-                      await pool.query(`
-                                                INSERT INTO datos_clima (fecha, ucp, p1_t, p1_h, p1_v, p1_i)
-                                                VALUES ('${fechaNueva}', '${ciudad}', ${dataClima.p1_t}, ${dataClima.p1_h}, ${dataClima.p1_v}, '${dataClima.p1_i}')
-                                            `);
-
-                      console.log(`Día añadido: ${fechaNueva}`);
-                      saveLog(
-                        `${moment().format(
-                          "DD-MM-YYYY HH:mm:ss"
-                        )} => Día añadido: ${fechaNueva} con datos climáticos (T: ${
-                          dataClima.p1_t
-                        }, H: ${dataClima.p1_h}, V: ${
-                          dataClima.p1_v
-                        }) para la ciudad ${ciudad}\n`
-                      );
-
-                      // Actualizar los periodos de p2 a p24 para el nuevo día
-                      for (let n = 2; n <= 24; n++) {
-                        await pool.query(`
-                                                    UPDATE datos_clima 
-                                                    SET p${n}_t=${
-                          dataClima[`p${n}_t`]
-                        }, p${n}_h=${dataClima[`p${n}_h`]}, p${n}_v=${
-                          dataClima[`p${n}_v`]
-                        }, p${n}_v='${dataClima[`p${n}_i`]}'
-                                                    WHERE fecha='${fechaNueva}' AND ucp='${ciudad}' RETURNING *
-                                                `);
-                      }
-                    } else {
-                      console.log(
-                        `El día ${fechaNueva} ya existe, no se añade.`
-                      );
-                      saveLog(
-                        `${moment().format(
-                          "DD-MM-YYYY HH:mm:ss"
-                        )} => El día ${fechaNueva} ya existe, no se añade para la ciudad ${ciudad}\n`
-                      );
-                    }
-                  }
-
-                  console.log(
-                    `Proceso de relleno completado hasta la fecha actual (${fechaActual})`
-                  );
-                  saveLog(
-                    `${moment().format(
-                      "DD-MM-YYYY HH:mm:ss"
-                    )} => Proceso de relleno completado hasta la fecha actual (${fechaActual}) para la ciudad ${ciudad}\n`
-                  );
-                };
-
-                //Se completa con ello los 12 días
-                const row2 = await pool.query(
-                  QUERYS.buscarUltimasFechasClimaPronostico,
-                  [ucpMC, 1]
-                );
-                const ultimaFecha = await pool.query(
-                  `
-                                    SELECT MAX(fecha) AS ultima_fecha 
-                                    FROM public.datos_clima 
-                                    WHERE ucp = $1 AND fecha < CURRENT_DATE
-                                `,
-                  [ucpMC]
-                );
-
-                if (row2.rowCount > 0) {
-                  await rellenarDiasHastaHoy(
-                    ucpMC,
-                    ultimaFecha.rows[0]?.ultima_fecha
-                  );
-                  const diasiguiente = moment(row2.rows[0].fecha)
-                    .add(1, "days")
-                    .format("YYYY-MM-DD");
-                  const search = await pool.query(QUERYS.buscarFechaClima, [
-                    diasiguiente,
-                    ucpMC,
-                  ]);
-                  if (search.rowCount == 0) {
-                    //Si no existe fecha se agregan los periodos correspondientes
-
-                    const fechaMaxima = moment()
-                      .add(12, "days")
-                      .format("YYYY-MM-DD");
-                    console.log(
-                      "fecha punto 3:",
-                      diasiguiente,
-                      "fecha Maxima:",
-                      fechaMaxima
-                    );
-                    if (diasiguiente <= fechaMaxima) {
-                      await pool.query(
-                        `INSERT INTO datos_clima (fecha, ucp, p1_t, p1_h, p1_v, p1_i) VALUES ('${diasiguiente}', '${ucpMC}', ${row2.rows[0].p1_t}, ${row2.rows[0].p1_h}, ${row2.rows[0].p1_v}, '${row2.rows[0].p1_i}')`
-                      );
-                    }
-                  }
-                  for (let n = 2; n <= 24; n++) {
-                    await pool.query(
-                      `UPDATE datos_clima SET p${n}_t=${
-                        row2.rows[0][`p${n}_t`]
-                      }, p${n}_h=${row2.rows[0][`p${n}_t`]}, p${n}_v=${
-                        row2.rows[0][`p${n}_v`]
-                      }, p${n}_i='${
-                        row2.rows[0][`p${n}_i`]
-                      }' WHERE fecha='${diasiguiente}' AND ucp='${ucpMC}' RETURNING *`
-                    );
-                  }
-                }
-
-                //Bucamos lo ultimos 13 días agregados
-                const row3 = await pool.query(
-                  QUERYS.buscarUltimasFechasClimaPronostico,
-                  [ucpMC, 13]
-                );
-                //console.log(row3.rows, 'Bucamos lo ultimos 13 días agregados')
-                if (row3.rowCount > 0) {
-                  let k = 0;
-                  while (k < row3.rowCount) {
-                    // Extraemos los datos climáticos por cada fila (día) de la base de datos
-                    let dataClima = row3.rows[k];
-
-                    // Rellenar los periodos vacíos con el siguiente valor no vacío disponible
-                    dataClima = rellenarPeriodos(dataClima);
-
-                    // Actualizamos los datos climáticos ya rellenados en la base de datos
-                    for (let j = 1; j <= 24; j++) {
-                      await pool.query(
-                        `UPDATE datos_clima 
-                                                 SET p${j}_t = ${
-                          dataClima[`p${j}_t`]
-                        }, 
-                                                     p${j}_h = ${
-                          dataClima[`p${j}_h`]
-                        }, 
-                                                     p${j}_v = ${
-                          dataClima[`p${j}_v`]
-                        },
-                                                     p${j}_i = '${
-                          dataClima[`p${j}_i`]
-                        }'
-                                                 WHERE fecha = '${moment(
-                                                   row3.rows[k]["fecha"]
-                                                 ).format("YYYY-MM-DD")}' 
-                                                 AND ucp = '${ucpMC}' 
-                                                 RETURNING *`
-                      );
-                    }
-                    k++; // Avanzamos al siguiente día de pronóstico
-                  }
-                }
-
-                console.log("****FIN*****");
-                saveLog(
-                  `${moment().format(
-                    "DD-MM-YYYY HH:mm:ss"
-                  )} => Se finalizó el proceso para Pronóstico correctamente para ${ciudad}\n`
-                );
-              } else {
-                saveLog(
-                  `${moment().format(
-                    "DD-MM-YYYY HH:mm:ss"
-                  )} => No se encuentró datos de Pronóstico en la URL ${apiPronostico}\n`
-                );
-              }
-            } else {
-              saveLog(
-                `${moment().format("DD-MM-YYYY HH:mm:ss")} => El MC ${
-                  fila.aux2
-                } de la BD no se encuentra en el Switch Case\n`
-              );
-            }
-          } else {
-            saveLog(
-              `${moment().format(
-                "DD-MM-YYYY HH:mm:ss"
-              )} => No se encuentró la Key para Pronóstico\n`
+        const search = await pool.query(QUERYS.buscarFechaClima, [
+          fecha[0],
+          ucpMC,
+        ]);
+        if (search.rowCount > 0) {
+          await queryDual(
+            clientEmpresa,
+            `UPDATE datos_clima SET p${pos}_t=${tem}, p${pos}_h=${hum}, p${pos}_v=${vel}, p${pos}_i='${ico}' WHERE fecha='${fecha[0]}' AND ucp='${ucpMC}'`,
+          );
+        } else {
+          const fechaMaxima = moment().add(12, "days").format("YYYY-MM-DD");
+          if (fecha[0] <= fechaMaxima) {
+            await queryDual(
+              clientEmpresa,
+              `INSERT INTO datos_clima (fecha, ucp, p${pos}_t, p${pos}_h, p${pos}_v, p${pos}_i) VALUES ('${fecha[0]}', '${ucpMC}', ${tem}, ${hum}, ${vel}, '${ico}')`,
             );
           }
         }
-      } else {
-        saveLog(
-          `${moment().format(
-            "DD-MM-YYYY HH:mm:ss"
-          )} => No se encuentró Mercados registrados para Pronóstico\n`
-        );
       }
-      //FIN DE PRONÓSTICO
-      if (res != undefined) return res.json({ success: true, message: `OK` });
-    } else {
-      saveLog(
-        `${moment().format(
-          "DD-MM-YYYY HH:mm:ss"
-        )} => Ya se ha generado el registro para la fecha ${diaAnterior}\n`
+
+      // Rellenar iconos faltantes
+      const buscarIconos = await pool.query(
+        QUERYS.buscarUltimasFechasClimaPronostico,
+        [ucpMC, 13],
       );
-      if (res != undefined)
+      if (buscarIconos.rowCount > 0) {
+        const periodosConDatos = [3, 6, 9, 12, 15, 18, 21, 24];
+        const mapFaltantes = {
+          3: [1, 2],
+          6: [4, 5],
+          9: [7, 8],
+          12: [10, 11],
+          15: [13, 14],
+          18: [16, 17],
+          21: [19, 20],
+          24: [22, 23],
+        };
+        for (const rowIcono of buscarIconos.rows) {
+          const fecha = moment(rowIcono.fecha).format("YYYY-MM-DD");
+          for (const pos of periodosConDatos) {
+            const valorIcono = rowIcono[`p${pos}_i`];
+            for (const faltante of mapFaltantes[pos]) {
+              await queryDual(
+                clientEmpresa,
+                `UPDATE datos_clima SET p${faltante}_i='${valorIcono}' WHERE fecha='${fecha}' AND ucp='${ucpMC}'`,
+              );
+            }
+          }
+        }
+      }
+
+      // Duplicar días hasta 12 días adelante
+      const row = await pool.query(QUERYS.buscarUltimasFechasClimaPronostico, [
+        ucpMC,
+        1,
+      ]);
+      if (row.rowCount > 0) {
+        for (let i = 0; i < 7; i++) {
+          const diasiguiente = moment(row.rows[0].fecha)
+            .add(i, "days")
+            .format("YYYY-MM-DD");
+          const search = await pool.query(QUERYS.buscarFechaClima, [
+            diasiguiente,
+            ucpMC,
+          ]);
+          const fechaMaxima = moment().add(12, "days").format("YYYY-MM-DD");
+          if (search.rowCount === 0 && diasiguiente <= fechaMaxima) {
+            await queryDual(
+              clientEmpresa,
+              `INSERT INTO datos_clima (fecha, ucp, p1_t, p1_h, p1_v, p1_i) VALUES ('${diasiguiente}', '${ucpMC}', ${row.rows[0].p1_t}, ${row.rows[0].p1_h}, ${row.rows[0].p1_v}, '${row.rows[0].p1_i}')`,
+            );
+          }
+          for (let n = 2; n <= 24; n++) {
+            await queryDual(
+              clientEmpresa,
+              `UPDATE datos_clima SET p${n}_t=${row.rows[0][`p${n}_t`]}, p${n}_h=${row.rows[0][`p${n}_t`]}, p${n}_v=${row.rows[0][`p${n}_v`]}, p${n}_i='${row.rows[0][`p${n}_i`]}' WHERE fecha='${diasiguiente}' AND ucp='${ucpMC}'`,
+            );
+          }
+        }
+      }
+
+      // Rellenar días hasta hoy si hay huecos
+      const row2 = await pool.query(QUERYS.buscarUltimasFechasClimaPronostico, [
+        ucpMC,
+        1,
+      ]);
+      const ultimaFecha = await pool.query(
+        `SELECT MAX(fecha) AS ultima_fecha FROM public.datos_clima WHERE ucp = $1 AND fecha < CURRENT_DATE`,
+        [ucpMC],
+      );
+      if (row2.rowCount > 0) {
+        await rellenarDiasHastaHoy(
+          ucpMC,
+          ultimaFecha.rows[0]?.ultima_fecha,
+          clientEmpresa,
+        );
+        const diasiguiente = moment(row2.rows[0].fecha)
+          .add(1, "days")
+          .format("YYYY-MM-DD");
+        const search = await pool.query(QUERYS.buscarFechaClima, [
+          diasiguiente,
+          ucpMC,
+        ]);
+        const fechaMaxima = moment().add(12, "days").format("YYYY-MM-DD");
+        if (search.rowCount === 0 && diasiguiente <= fechaMaxima) {
+          await queryDual(
+            clientEmpresa,
+            `INSERT INTO datos_clima (fecha, ucp, p1_t, p1_h, p1_v, p1_i) VALUES ('${diasiguiente}', '${ucpMC}', ${row2.rows[0].p1_t}, ${row2.rows[0].p1_h}, ${row2.rows[0].p1_v}, '${row2.rows[0].p1_i}')`,
+          );
+        }
+        for (let n = 2; n <= 24; n++) {
+          await queryDual(
+            clientEmpresa,
+            `UPDATE datos_clima SET p${n}_t=${row2.rows[0][`p${n}_t`]}, p${n}_h=${row2.rows[0][`p${n}_t`]}, p${n}_v=${row2.rows[0][`p${n}_v`]}, p${n}_i='${row2.rows[0][`p${n}_i`]}' WHERE fecha='${diasiguiente}' AND ucp='${ucpMC}'`,
+          );
+        }
+      }
+
+      // Relleno final de periodos vacíos en los últimos 13 días
+      const row3 = await pool.query(QUERYS.buscarUltimasFechasClimaPronostico, [
+        ucpMC,
+        13,
+      ]);
+      if (row3.rowCount > 0) {
+        for (const rowDia of row3.rows) {
+          const dataClima = rellenarPeriodos(rowDia);
+          const fechaDia = moment(rowDia.fecha).format("YYYY-MM-DD");
+          for (let j = 1; j <= 24; j++) {
+            await queryDual(
+              clientEmpresa,
+              `UPDATE datos_clima SET p${j}_t=${dataClima[`p${j}_t`]}, p${j}_h=${dataClima[`p${j}_h`]}, p${j}_v=${dataClima[`p${j}_v`]}, p${j}_i='${dataClima[`p${j}_i`]}' WHERE fecha='${fechaDia}' AND ucp='${ucpMC}'`,
+            );
+          }
+        }
+      }
+
+      log(`Pronóstico finalizado para ${ciudad}`);
+    } else {
+      log(`Sin datos de pronóstico para ${ciudad}`);
+    }
+  } catch (err) {
+    log(`Error en Pronóstico para ${ciudad}: ${err.message}`);
+  }
+};
+
+// ─── Mapa de ciudades ─────────────────────────────────────────────────────────
+const CIUDADES_MAP = {
+  Antioquia: { hist: "107060", pron: "3671950", nombre: "Medellin" },
+  Atlantico: { hist: "107123", pron: "3689147", nombre: "Atlantico" },
+  GM: { hist: "105920", pron: "3668605", nombre: "GM" },
+};
+
+// ─── Controller principal ─────────────────────────────────────────────────────
+export const climaController = async (req, res) => {
+  try {
+    const diaAnterior = moment().add(-1, "day").format("YYYY-MM-DD");
+
+    // Verificar si ya se procesó hoy (sobre jano_proxy)
+    const buscarLog = await pool.query(QUERYS.buscarUltimaFechaClimaLog, [
+      diaAnterior,
+    ]);
+    if (buscarLog.rowCount > 0) {
+      saveLog(
+        `${moment().format("DD-MM-YYYY HH:mm:ss")} => Ya se generó el registro para ${diaAnterior}\n`,
+      );
+      if (res)
         return res.json({
           success: false,
           message: `Ya se ha generado el registro para la fecha ${diaAnterior}`,
         });
+      return;
     }
+
+    // Calcular cuántos días faltan (sobre jano_proxy)
+    let totaldias = 0;
+    const buscarUltimaFecha = await pool.query(QUERYS.buscarUltimaFechaClima);
+    if (buscarUltimaFecha.rowCount > 0) {
+      const fechaActual = new Date().getTime();
+      const fechaBuscada = new Date(buscarUltimaFecha.rows[0].fecha).getTime();
+      totaldias = parseInt(
+        (fechaActual - fechaBuscada) / (1000 * 60 * 60 * 24),
+      );
+    }
+
+    // ── Obtener todos los mercados desde Redis ────────────────────────────────
+    const resultMercados = await mercadosService.listar();
+    if (!resultMercados.success || !resultMercados.data?.length) {
+      saveLog(
+        `${moment().format("DD-MM-YYYY HH:mm:ss")} => No hay mercados en Redis\n`,
+      );
+      if (res)
+        return res.json({
+          success: false,
+          message: "No hay mercados en Redis",
+        });
+      return;
+    }
+
+    // ── Por cada mercado, conectarse a su DB ──────────────────────────────────
+    for (const mercado of resultMercados.data) {
+      const session = mercado.accesos;
+      const clientEmpresa = createConectionPG(session);
+
+      try {
+        await clientEmpresa.connect();
+
+        const ucpResult = await clientEmpresa.query(QUERYS.cargarUCP, [
+          "2",
+          "1",
+        ]);
+        const ucpRows = ucpResult.rows;
+
+        const bKeyH = await clientEmpresa.query(QUERYS.buscarKey, [15]);
+        const bKeyP = await clientEmpresa.query(QUERYS.buscarKey, [12]);
+        const keyHist = bKeyH.rowCount > 0 ? bKeyH.rows[0].aux : null;
+        const keyPron = bKeyP.rowCount > 0 ? bKeyP.rows[0].aux : null;
+
+        if (!ucpRows.length) {
+          saveLog(
+            `${moment().format("DD-MM-YYYY HH:mm:ss")} => Sin UCPs en ${session?.basededatos}\n`,
+          );
+          continue;
+        }
+
+        // Procesar cada UCP manteniendo la conexión abierta para escritura dual
+        for (const fila of ucpRows) {
+          const ciudadKey = fila.aux2?.trim();
+          const ciudadInfo = CIUDADES_MAP[ciudadKey];
+
+          if (!ciudadInfo) {
+            saveLog(
+              `${moment().format("DD-MM-YYYY HH:mm:ss")} => UCP "${ciudadKey}" no está en CIUDADES_MAP (empresa: ${session?.basededatos})\n`,
+            );
+            continue;
+          }
+
+          await procesarMercado(
+            clientEmpresa,
+            ciudadKey,
+            ciudadInfo.hist,
+            ciudadInfo.pron,
+            ciudadInfo.nombre,
+            keyHist,
+            keyPron,
+            totaldias,
+          );
+        }
+      } catch (err) {
+        saveLog(
+          `${moment().format("DD-MM-YYYY HH:mm:ss")} => Error en empresa ${session?.basededatos}: ${err.message}\n`,
+        );
+      } finally {
+        // Siempre cerrar la conexión de la empresa al terminar todos sus UCPs
+        await clientEmpresa.end();
+      }
+    }
+
+    if (res) return res.json({ success: true, message: "OK" });
   } catch (error) {
     saveLog(
-      `${moment().format("DD-MM-YYYY HH:mm:ss")} => Error: ${error.stack}\n`
+      `${moment().format("DD-MM-YYYY HH:mm:ss")} => Error: ${error.stack}\n`,
     );
-    if (res != undefined)
+    if (res)
       return res.json({ success: false, message: `Error: ${error.stack}` });
   }
 };
