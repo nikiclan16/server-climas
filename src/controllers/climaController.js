@@ -436,7 +436,13 @@ const procesarMercado = async (
 const CIUDADES_MAP = {
   Antioquia: { hist: "107060", pron: "3671950", nombre: "Medellin" },
   Atlantico: { hist: "107123", pron: "3689147", nombre: "Atlantico" },
+  Bolivar: { hist: "107563", pron: "3689147", nombre: "Bolivar" },
+  Planeta: { hist: "108095", pron: "3689759", nombre: "Planeta" },
+  CordobaSucre: { hist: "108095", pron: "3689759", nombre: "CordobaSucre" },
+  Sincelejo: { hist: "106776", pron: "3667983", nombre: "Sincelejo" },
+  Cesar: { hist: "101957", pron: "3666304", nombre: "Cesar" },
   GM: { hist: "105920", pron: "3668605", nombre: "GM" },
+  TubosCaribe: { hist: "107563", pron: "3687238", nombre: "TubosCaribe" },
 };
 
 // ─── Controller principal ─────────────────────────────────────────────────────
