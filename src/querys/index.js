@@ -9,4 +9,5 @@ export const QUERYS = {
   actualizarFechaClima: `SELECT * FROM datos_clima WHERE fecha = $1 AND ucp=$2`,
   buscarUltimasFechasClimaPronostico: `SELECT * FROM datos_clima WHERE ucp=$1 ORDER BY fecha DESC LIMIT $2`,
   buscarTemperatura: `SELECT * FROM datos_clima WHERE fecha = $1`,
+  buscarConfigCiudadClima: `SELECT * FROM config_ciudades_clima WHERE db_empresa = $1 AND ucp = $2`,
 };

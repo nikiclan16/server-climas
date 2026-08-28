@@ -432,17 +432,25 @@ const procesarMercado = async (
   }
 };
 
-// ─── Mapa de ciudades ─────────────────────────────────────────────────────────
-const CIUDADES_MAP = {
-  Antioquia: { hist: "107060", pron: "3671950", nombre: "Medellin" },
-  Atlantico: { hist: "107123", pron: "3689147", nombre: "Atlantico" },
-  Bolivar: { hist: "107563", pron: "3689147", nombre: "Bolivar" },
-  Planeta: { hist: "108095", pron: "3689759", nombre: "Planeta" },
-  CordobaSucre: { hist: "108095", pron: "3689759", nombre: "CordobaSucre" },
-  Sincelejo: { hist: "106776", pron: "3667983", nombre: "Sincelejo" },
-  Cesar: { hist: "101957", pron: "3666304", nombre: "Cesar" },
-  GM: { hist: "105920", pron: "3668605", nombre: "GM" },
-  TubosCaribe: { hist: "107563", pron: "3687238", nombre: "TubosCaribe" },
+// ─── Config de ciudad por mercado ───────────────────────────────────────────
+// Antes era un objeto hardcodeado (CIUDADES_MAP); ahora cada empresa
+// configura su propia ciudad por mercado desde Configuración (pronosticos
+// frontend), guardada en config_ciudades_clima (jano_proxy), scoped por
+// db_empresa — así cada empresa solo ve/edita sus propios mercados aunque
+// la tabla sea centralizada. Ver scripts/migrar_config_ciudades_clima.js
+// para la migración inicial de los mercados que antes vivían en el objeto.
+const buscarInfoCiudad = async (dbEmpresa, ciudadKey) => {
+  const result = await pool.query(QUERYS.buscarConfigCiudadClima, [
+    dbEmpresa,
+    ciudadKey,
+  ]);
+  if (result.rowCount === 0) return null;
+  const row = result.rows[0];
+  return {
+    hist: row.accuweather_id,
+    pron: row.openweather_id,
+    nombre: row.ciudad_nombre || ciudadKey,
+  };
 };
 
 // ─── Controller principal ─────────────────────────────────────────────────────
@@ -520,11 +528,14 @@ export const climaController = async (req, res) => {
         // Procesar cada UCP manteniendo la conexión abierta para escritura dual
         for (const fila of ucpRows) {
           const ciudadKey = fila.aux2?.trim();
-          const ciudadInfo = CIUDADES_MAP[ciudadKey];
+          const ciudadInfo = await buscarInfoCiudad(
+            session?.basededatos,
+            ciudadKey,
+          );
 
           if (!ciudadInfo) {
             saveLog(
-              `${moment().format("DD-MM-YYYY HH:mm:ss")} => UCP "${ciudadKey}" no está en CIUDADES_MAP (empresa: ${session?.basededatos})\n`,
+              `${moment().format("DD-MM-YYYY HH:mm:ss")} => UCP "${ciudadKey}" sin ciudad configurada en config_ciudades_clima (empresa: ${session?.basededatos}) — configúrala en Configuración > Clima\n`,
             );
             continue;
           }
