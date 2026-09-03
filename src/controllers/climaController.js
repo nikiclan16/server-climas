@@ -30,6 +30,85 @@ const queryDual = async (clientEmpresa, sql, params = []) => {
   return results[0].value;
 };
 
+// ─── Escritura dual con llave distinta por lado ──────────────────────────────
+// La copia central (jano_proxy, la que usa la app) queda compartida por
+// ciudad -- si dos mercados usan la misma ciudad, escriben/leen la MISMA
+// fila. La copia de la BD de la empresa es solo respaldo (no la usa la
+// app, según confirmó el usuario) y sigue quedando por mercado (su propio
+// ucp), igual que siempre -- por eso no basta con una sola sentencia SQL
+// compartida entre los dos lados como antes (queryDual); cada lado necesita
+// su propio valor de "llave".
+//
+// `whereCiudad` arma el fragmento WHERE para identificar la fila: por
+// ciudad_id cuando se conoce (preciso, no depende de tildes/mayúsculas),
+// o por nombre de ciudad si todavía no hay ciudad_id (mercado configurado
+// antes de este cambio) -- nunca por el ucp del mercado en el lado central.
+const whereCiudad = (ucpValor, ciudadIdValor) =>
+  ciudadIdValor != null ? `ciudad_id=${ciudadIdValor}` : `ucp='${ucpValor}'`;
+
+// Fragmento de columna+valor para un INSERT: incluye `ciudad_id` solo
+// cuando corresponde (lado central) — la tabla de la empresa no tiene esa
+// columna, así que ahí NUNCA debe aparecer, ni siquiera con NULL.
+const columnaCiudadId = (ciudadIdValor) =>
+  ciudadIdValor !== undefined
+    ? { col: ", ciudad_id", val: `, ${ciudadIdValor ?? "NULL"}` }
+    : { col: "", val: "" };
+
+// `build(ucpValor, ciudadIdValor)` arma el SQL completo para un lado —
+// ciudadIdValor viene como el id real (o null) para el central, y como
+// `undefined` para la empresa. Esa distinción entre null/undefined importa
+// para los INSERT: la tabla de la empresa NO tiene columna ciudad_id, así
+// que un build de INSERT debe usar `ciudadIdValor !== undefined` para
+// decidir si incluye esa columna o no (ver columnaCiudadId más abajo) —
+// pasar simplemente null ahí rompería el INSERT de respaldo con "column
+// ciudad_id does not exist".
+const queryDualCiudad = async (
+  clientEmpresa,
+  build,
+  { ucpMC, ciudad, ciudadId },
+) => {
+  const sqlCentral = build(ciudad, ciudadId);
+  const sqlEmpresa = build(ucpMC, undefined);
+
+  const results = await Promise.allSettled([
+    pool.query(sqlCentral),
+    clientEmpresa.query(sqlEmpresa),
+  ]);
+
+  if (results[1].status === "rejected") {
+    saveLog(
+      `${moment().format("DD-MM-YYYY HH:mm:ss")} => [EMPRESA] Error en query dual: ${results[1].reason?.message} | SQL: ${sqlEmpresa.slice(0, 120)}\n`,
+    );
+  }
+
+  if (results[0].status === "rejected") throw results[0].reason;
+  return results[0].value;
+};
+
+// Lecturas de la copia central (solo jano_proxy — "Lectura solo desde
+// jano_proxy como fuente de verdad", ver más abajo): por ciudad_id cuando
+// se conoce, por nombre de ciudad si no.
+const centralBuscarClimaPeriodos = (ciudadId, ciudad, fecha) =>
+  ciudadId != null
+    ? pool.query(QUERYS.buscarClimaPeriodosPorCiudad, [ciudadId, fecha])
+    : pool.query(QUERYS.buscarClimaPeriodos, [ciudad, fecha]);
+
+const centralBuscarFechaClima = (ciudadId, ciudad, fecha) =>
+  ciudadId != null
+    ? pool.query(QUERYS.buscarFechaClimaPorCiudad, [fecha, ciudadId])
+    : pool.query(QUERYS.buscarFechaClima, [fecha, ciudad]);
+
+const centralBuscarUltimasFechas = (ciudadId, ciudad, limite) =>
+  ciudadId != null
+    ? pool.query(QUERYS.buscarUltimasFechasClimaPronosticoPorCiudad, [
+        ciudadId,
+        limite,
+      ])
+    : pool.query(QUERYS.buscarUltimasFechasClimaPronostico, [
+        ciudad,
+        limite,
+      ]);
+
 // ─── Helpers locales ─────────────────────────────────────────────────────────
 
 const rellenarPeriodos = (dataClima) => {
@@ -79,41 +158,47 @@ const rellenarPeriodos = (dataClima) => {
   return dataClima;
 };
 
-const rellenarDiasHastaHoy = async (ucpMC, ultimaFecha, clientEmpresa) => {
+const rellenarDiasHastaHoy = async (
+  ucpMC,
+  ciudad,
+  ciudadId,
+  ultimaFecha,
+  clientEmpresa,
+) => {
   const fechaActual = moment().format("YYYY-MM-DD");
   let fechaIterar = moment(ultimaFecha);
 
   saveLog(
-    `${moment().format("DD-MM-YYYY HH:mm:ss")} => Iniciando relleno desde ${ultimaFecha} hasta ${fechaActual} para ${ucpMC}\n`,
+    `${moment().format("DD-MM-YYYY HH:mm:ss")} => Iniciando relleno desde ${ultimaFecha} hasta ${fechaActual} para ${ciudad}\n`,
   );
 
   while (fechaIterar.isBefore(fechaActual)) {
     fechaIterar.add(1, "days");
     const fechaNueva = fechaIterar.format("YYYY-MM-DD");
 
-    const search = await pool.query(QUERYS.buscarFechaClima, [
-      fechaNueva,
-      ucpMC,
-    ]);
+    const search = await centralBuscarFechaClima(ciudadId, ciudad, fechaNueva);
     if (search.rowCount === 0) {
-      const ultimoDia = await pool.query(
-        QUERYS.buscarUltimasFechasClimaPronostico,
-        [ucpMC, 1],
-      );
+      const ultimoDia = await centralBuscarUltimasFechas(ciudadId, ciudad, 1);
       let dataClima = rellenarPeriodos(ultimoDia.rows[0]);
 
-      await queryDual(
+      await queryDualCiudad(
         clientEmpresa,
-        `INSERT INTO datos_clima (fecha, ucp, p1_t, p1_h, p1_v, p1_i) VALUES ('${fechaNueva}', '${ucpMC}', ${dataClima.p1_t}, ${dataClima.p1_h}, ${dataClima.p1_v}, '${dataClima.p1_i}')`,
+        (ucpValor, ciudadIdValor) => {
+          const { col, val } = columnaCiudadId(ciudadIdValor);
+          return `INSERT INTO datos_clima (fecha, ucp${col}, p1_t, p1_h, p1_v, p1_i) VALUES ('${fechaNueva}', '${ucpValor}'${val}, ${dataClima.p1_t}, ${dataClima.p1_h}, ${dataClima.p1_v}, '${dataClima.p1_i}')`;
+        },
+        { ucpMC, ciudad, ciudadId },
       );
       for (let n = 2; n <= 24; n++) {
-        await queryDual(
+        await queryDualCiudad(
           clientEmpresa,
-          `UPDATE datos_clima SET p${n}_t=${dataClima[`p${n}_t`]}, p${n}_h=${dataClima[`p${n}_h`]}, p${n}_v=${dataClima[`p${n}_v`]}, p${n}_i='${dataClima[`p${n}_i`]}' WHERE fecha='${fechaNueva}' AND ucp='${ucpMC}'`,
+          (ucpValor, ciudadIdValor) =>
+            `UPDATE datos_clima SET p${n}_t=${dataClima[`p${n}_t`]}, p${n}_h=${dataClima[`p${n}_h`]}, p${n}_v=${dataClima[`p${n}_v`]}, p${n}_i='${dataClima[`p${n}_i`]}' WHERE fecha='${fechaNueva}' AND ${whereCiudad(ucpValor, ciudadIdValor)}`,
+          { ucpMC, ciudad, ciudadId },
         );
       }
       saveLog(
-        `${moment().format("DD-MM-YYYY HH:mm:ss")} => Día añadido: ${fechaNueva} para ${ucpMC}\n`,
+        `${moment().format("DD-MM-YYYY HH:mm:ss")} => Día añadido: ${fechaNueva} para ${ciudad}\n`,
       );
     }
   }
@@ -141,11 +226,13 @@ const procesarMercado = async (
   clientEmpresa,
   ucpMC,
   ciudad,
+  ciudadId,
   dataHistorico,
   dataPronostico,
 ) => {
   const log = (msg) =>
     saveLog(`${moment().format("DD-MM-YYYY HH:mm:ss")} => ${msg}\n`);
+  const clave = { ucpMC, ciudad, ciudadId };
 
   // ── HISTÓRICO ──────────────────────────────────────────────────────────────
   if (dataHistorico) {
@@ -180,14 +267,16 @@ const procesarMercado = async (
 
         for (let p = 0; p < 23; p++) {
           // Lectura solo desde jano_proxy como fuente de verdad
-          const bfecha = await pool.query(QUERYS.buscarClimaPeriodos, [
-            ucpMC,
+          const bfecha = await centralBuscarClimaPeriodos(
+            ciudadId,
+            ciudad,
             fechaAnterior,
-          ]);
+          );
 
           if (bfecha.rowCount === 0) {
             if (p === 0) {
-              // Log dual (datos_climalog también se replica)
+              // Log dual (datos_climalog también se replica) — sigue por
+              // ucp del mercado en ambos lados, es solo un marcador/log.
               await queryDual(clientEmpresa, QUERYS.agregarClimaPronosticoLog, [
                 fechaAnterior,
                 ucpMC,
@@ -195,26 +284,34 @@ const procesarMercado = async (
               const valor24 = parseFloat(
                 arrayHistorico[23].periodos[`p24_t`],
               ).toFixed(4);
-              await queryDual(
+              await queryDualCiudad(
                 clientEmpresa,
-                `INSERT INTO datos_clima (fecha, ucp, p24_t) VALUES ('${fechaAnterior}', '${ucpMC}', ${valor24})`,
+                (ucpValor, ciudadIdValor) => {
+                  const { col, val } = columnaCiudadId(ciudadIdValor);
+                  return `INSERT INTO datos_clima (fecha, ucp${col}, p24_t) VALUES ('${fechaAnterior}', '${ucpValor}'${val}, ${valor24})`;
+                },
+                clave,
               );
             }
             const valor = parseFloat(
               arrayHistorico[p].periodos[`p${p + 1}_t`],
             ).toFixed(4);
-            await queryDual(
+            await queryDualCiudad(
               clientEmpresa,
-              `UPDATE datos_clima SET p${p + 1}_t=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`,
+              (ucpValor, ciudadIdValor) =>
+                `UPDATE datos_clima SET p${p + 1}_t=${valor} WHERE fecha='${fechaAnterior}' AND ${whereCiudad(ucpValor, ciudadIdValor)}`,
+              clave,
             );
           } else {
             const campoRef = p === 0 ? "p24_t" : `p${p + 1}_t`;
             const valor = parseFloat(
               arrayHistorico[p].periodos[`p${p + 1}_t`],
             ).toFixed(4);
-            await queryDual(
+            await queryDualCiudad(
               clientEmpresa,
-              `UPDATE datos_clima SET ${campoRef}=${valor} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`,
+              (ucpValor, ciudadIdValor) =>
+                `UPDATE datos_clima SET ${campoRef}=${valor} WHERE fecha='${fechaAnterior}' AND ${whereCiudad(ucpValor, ciudadIdValor)}`,
+              clave,
             );
           }
 
@@ -222,37 +319,49 @@ const procesarMercado = async (
             arrayHistorico[p].periodos[`p${p + 1}_h`],
           ).toFixed(4);
           if (p === 0)
-            await queryDual(
+            await queryDualCiudad(
               clientEmpresa,
-              `UPDATE datos_clima SET p24_h=${valor_h} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`,
+              (ucpValor, ciudadIdValor) =>
+                `UPDATE datos_clima SET p24_h=${valor_h} WHERE fecha='${fechaAnterior}' AND ${whereCiudad(ucpValor, ciudadIdValor)}`,
+              clave,
             );
-          await queryDual(
+          await queryDualCiudad(
             clientEmpresa,
-            `UPDATE datos_clima SET p${p + 1}_h=${valor_h} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`,
+            (ucpValor, ciudadIdValor) =>
+              `UPDATE datos_clima SET p${p + 1}_h=${valor_h} WHERE fecha='${fechaAnterior}' AND ${whereCiudad(ucpValor, ciudadIdValor)}`,
+            clave,
           );
 
           const valor_v = parseFloat(
             arrayHistorico[p].periodos[`p${p + 1}_v`],
           ).toFixed(4);
           if (p === 0)
-            await queryDual(
+            await queryDualCiudad(
               clientEmpresa,
-              `UPDATE datos_clima SET p24_v=${valor_v} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`,
+              (ucpValor, ciudadIdValor) =>
+                `UPDATE datos_clima SET p24_v=${valor_v} WHERE fecha='${fechaAnterior}' AND ${whereCiudad(ucpValor, ciudadIdValor)}`,
+              clave,
             );
-          await queryDual(
+          await queryDualCiudad(
             clientEmpresa,
-            `UPDATE datos_clima SET p${p + 1}_v=${valor_v} WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`,
+            (ucpValor, ciudadIdValor) =>
+              `UPDATE datos_clima SET p${p + 1}_v=${valor_v} WHERE fecha='${fechaAnterior}' AND ${whereCiudad(ucpValor, ciudadIdValor)}`,
+            clave,
           );
 
           const valor_i = arrayHistorico[p].periodos[`p${p + 1}_i`];
           if (p === 0)
-            await queryDual(
+            await queryDualCiudad(
               clientEmpresa,
-              `UPDATE datos_clima SET p24_i='${valor_i}' WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`,
+              (ucpValor, ciudadIdValor) =>
+                `UPDATE datos_clima SET p24_i='${valor_i}' WHERE fecha='${fechaAnterior}' AND ${whereCiudad(ucpValor, ciudadIdValor)}`,
+              clave,
             );
-          await queryDual(
+          await queryDualCiudad(
             clientEmpresa,
-            `UPDATE datos_clima SET p${p + 1}_i='${valor_i}' WHERE fecha='${fechaAnterior}' AND ucp='${ucpMC}'`,
+            (ucpValor, ciudadIdValor) =>
+              `UPDATE datos_clima SET p${p + 1}_i='${valor_i}' WHERE fecha='${fechaAnterior}' AND ${whereCiudad(ucpValor, ciudadIdValor)}`,
+            clave,
           );
         }
 
@@ -295,30 +404,38 @@ const procesarMercado = async (
         const vel = dataP.wind.speed;
         const ico = dataP.weather[0].id;
 
-        const search = await pool.query(QUERYS.buscarFechaClima, [
+        const search = await centralBuscarFechaClima(
+          ciudadId,
+          ciudad,
           fecha[0],
-          ucpMC,
-        ]);
+        );
         if (search.rowCount > 0) {
-          await queryDual(
+          await queryDualCiudad(
             clientEmpresa,
-            `UPDATE datos_clima SET p${pos}_t=${tem}, p${pos}_h=${hum}, p${pos}_v=${vel}, p${pos}_i='${ico}' WHERE fecha='${fecha[0]}' AND ucp='${ucpMC}'`,
+            (ucpValor, ciudadIdValor) =>
+              `UPDATE datos_clima SET p${pos}_t=${tem}, p${pos}_h=${hum}, p${pos}_v=${vel}, p${pos}_i='${ico}' WHERE fecha='${fecha[0]}' AND ${whereCiudad(ucpValor, ciudadIdValor)}`,
+            clave,
           );
         } else {
           const fechaMaxima = moment().add(12, "days").format("YYYY-MM-DD");
           if (fecha[0] <= fechaMaxima) {
-            await queryDual(
+            await queryDualCiudad(
               clientEmpresa,
-              `INSERT INTO datos_clima (fecha, ucp, p${pos}_t, p${pos}_h, p${pos}_v, p${pos}_i) VALUES ('${fecha[0]}', '${ucpMC}', ${tem}, ${hum}, ${vel}, '${ico}')`,
+              (ucpValor, ciudadIdValor) => {
+                const { col, val } = columnaCiudadId(ciudadIdValor);
+                return `INSERT INTO datos_clima (fecha, ucp${col}, p${pos}_t, p${pos}_h, p${pos}_v, p${pos}_i) VALUES ('${fecha[0]}', '${ucpValor}'${val}, ${tem}, ${hum}, ${vel}, '${ico}')`;
+              },
+              clave,
             );
           }
         }
       }
 
       // Rellenar iconos faltantes
-      const buscarIconos = await pool.query(
-        QUERYS.buscarUltimasFechasClimaPronostico,
-        [ucpMC, 13],
+      const buscarIconos = await centralBuscarUltimasFechas(
+        ciudadId,
+        ciudad,
+        13,
       );
       if (buscarIconos.rowCount > 0) {
         const periodosConDatos = [3, 6, 9, 12, 15, 18, 21, 24];
@@ -337,9 +454,11 @@ const procesarMercado = async (
           for (const pos of periodosConDatos) {
             const valorIcono = rowIcono[`p${pos}_i`];
             for (const faltante of mapFaltantes[pos]) {
-              await queryDual(
+              await queryDualCiudad(
                 clientEmpresa,
-                `UPDATE datos_clima SET p${faltante}_i='${valorIcono}' WHERE fecha='${fecha}' AND ucp='${ucpMC}'`,
+                (ucpValor, ciudadIdValor) =>
+                  `UPDATE datos_clima SET p${faltante}_i='${valorIcono}' WHERE fecha='${fecha}' AND ${whereCiudad(ucpValor, ciudadIdValor)}`,
+                clave,
               );
             }
           }
@@ -347,85 +466,99 @@ const procesarMercado = async (
       }
 
       // Duplicar días hasta 12 días adelante
-      const row = await pool.query(QUERYS.buscarUltimasFechasClimaPronostico, [
-        ucpMC,
-        1,
-      ]);
+      const row = await centralBuscarUltimasFechas(ciudadId, ciudad, 1);
       if (row.rowCount > 0) {
         for (let i = 0; i < 7; i++) {
           const diasiguiente = moment(row.rows[0].fecha)
             .add(i, "days")
             .format("YYYY-MM-DD");
-          const search = await pool.query(QUERYS.buscarFechaClima, [
+          const search = await centralBuscarFechaClima(
+            ciudadId,
+            ciudad,
             diasiguiente,
-            ucpMC,
-          ]);
+          );
           const fechaMaxima = moment().add(12, "days").format("YYYY-MM-DD");
           if (search.rowCount === 0 && diasiguiente <= fechaMaxima) {
-            await queryDual(
+            await queryDualCiudad(
               clientEmpresa,
-              `INSERT INTO datos_clima (fecha, ucp, p1_t, p1_h, p1_v, p1_i) VALUES ('${diasiguiente}', '${ucpMC}', ${row.rows[0].p1_t}, ${row.rows[0].p1_h}, ${row.rows[0].p1_v}, '${row.rows[0].p1_i}')`,
+              (ucpValor, ciudadIdValor) => {
+                const { col, val } = columnaCiudadId(ciudadIdValor);
+                return `INSERT INTO datos_clima (fecha, ucp${col}, p1_t, p1_h, p1_v, p1_i) VALUES ('${diasiguiente}', '${ucpValor}'${val}, ${row.rows[0].p1_t}, ${row.rows[0].p1_h}, ${row.rows[0].p1_v}, '${row.rows[0].p1_i}')`;
+              },
+              clave,
             );
           }
           for (let n = 2; n <= 24; n++) {
-            await queryDual(
+            await queryDualCiudad(
               clientEmpresa,
-              `UPDATE datos_clima SET p${n}_t=${row.rows[0][`p${n}_t`]}, p${n}_h=${row.rows[0][`p${n}_t`]}, p${n}_v=${row.rows[0][`p${n}_v`]}, p${n}_i='${row.rows[0][`p${n}_i`]}' WHERE fecha='${diasiguiente}' AND ucp='${ucpMC}'`,
+              (ucpValor, ciudadIdValor) =>
+                `UPDATE datos_clima SET p${n}_t=${row.rows[0][`p${n}_t`]}, p${n}_h=${row.rows[0][`p${n}_t`]}, p${n}_v=${row.rows[0][`p${n}_v`]}, p${n}_i='${row.rows[0][`p${n}_i`]}' WHERE fecha='${diasiguiente}' AND ${whereCiudad(ucpValor, ciudadIdValor)}`,
+              clave,
             );
           }
         }
       }
 
       // Rellenar días hasta hoy si hay huecos
-      const row2 = await pool.query(QUERYS.buscarUltimasFechasClimaPronostico, [
-        ucpMC,
-        1,
-      ]);
-      const ultimaFecha = await pool.query(
-        `SELECT MAX(fecha) AS ultima_fecha FROM public.datos_clima WHERE ucp = $1 AND fecha < CURRENT_DATE`,
-        [ucpMC],
-      );
+      const row2 = await centralBuscarUltimasFechas(ciudadId, ciudad, 1);
+      const ultimaFecha = ciudadId
+        ? await pool.query(
+            `SELECT MAX(fecha) AS ultima_fecha FROM public.datos_clima WHERE ciudad_id = $1 AND fecha < CURRENT_DATE`,
+            [ciudadId],
+          )
+        : await pool.query(
+            `SELECT MAX(fecha) AS ultima_fecha FROM public.datos_clima WHERE ucp = $1 AND fecha < CURRENT_DATE`,
+            [ciudad],
+          );
       if (row2.rowCount > 0) {
         await rellenarDiasHastaHoy(
           ucpMC,
+          ciudad,
+          ciudadId,
           ultimaFecha.rows[0]?.ultima_fecha,
           clientEmpresa,
         );
         const diasiguiente = moment(row2.rows[0].fecha)
           .add(1, "days")
           .format("YYYY-MM-DD");
-        const search = await pool.query(QUERYS.buscarFechaClima, [
+        const search = await centralBuscarFechaClima(
+          ciudadId,
+          ciudad,
           diasiguiente,
-          ucpMC,
-        ]);
+        );
         const fechaMaxima = moment().add(12, "days").format("YYYY-MM-DD");
         if (search.rowCount === 0 && diasiguiente <= fechaMaxima) {
-          await queryDual(
+          await queryDualCiudad(
             clientEmpresa,
-            `INSERT INTO datos_clima (fecha, ucp, p1_t, p1_h, p1_v, p1_i) VALUES ('${diasiguiente}', '${ucpMC}', ${row2.rows[0].p1_t}, ${row2.rows[0].p1_h}, ${row2.rows[0].p1_v}, '${row2.rows[0].p1_i}')`,
+            (ucpValor, ciudadIdValor) => {
+              const { col, val } = columnaCiudadId(ciudadIdValor);
+              return `INSERT INTO datos_clima (fecha, ucp${col}, p1_t, p1_h, p1_v, p1_i) VALUES ('${diasiguiente}', '${ucpValor}'${val}, ${row2.rows[0].p1_t}, ${row2.rows[0].p1_h}, ${row2.rows[0].p1_v}, '${row2.rows[0].p1_i}')`;
+            },
+            clave,
           );
         }
         for (let n = 2; n <= 24; n++) {
-          await queryDual(
+          await queryDualCiudad(
             clientEmpresa,
-            `UPDATE datos_clima SET p${n}_t=${row2.rows[0][`p${n}_t`]}, p${n}_h=${row2.rows[0][`p${n}_t`]}, p${n}_v=${row2.rows[0][`p${n}_v`]}, p${n}_i='${row2.rows[0][`p${n}_i`]}' WHERE fecha='${diasiguiente}' AND ucp='${ucpMC}'`,
+            (ucpValor, ciudadIdValor) =>
+              `UPDATE datos_clima SET p${n}_t=${row2.rows[0][`p${n}_t`]}, p${n}_h=${row2.rows[0][`p${n}_t`]}, p${n}_v=${row2.rows[0][`p${n}_v`]}, p${n}_i='${row2.rows[0][`p${n}_i`]}' WHERE fecha='${diasiguiente}' AND ${whereCiudad(ucpValor, ciudadIdValor)}`,
+            clave,
           );
         }
       }
 
       // Relleno final de periodos vacíos en los últimos 13 días
-      const row3 = await pool.query(QUERYS.buscarUltimasFechasClimaPronostico, [
-        ucpMC,
-        13,
-      ]);
+      const row3 = await centralBuscarUltimasFechas(ciudadId, ciudad, 13);
       if (row3.rowCount > 0) {
         for (const rowDia of row3.rows) {
           const dataClima = rellenarPeriodos(rowDia);
           const fechaDia = moment(rowDia.fecha).format("YYYY-MM-DD");
           for (let j = 1; j <= 24; j++) {
-            await queryDual(
+            await queryDualCiudad(
               clientEmpresa,
-              `UPDATE datos_clima SET p${j}_t=${dataClima[`p${j}_t`]}, p${j}_h=${dataClima[`p${j}_h`]}, p${j}_v=${dataClima[`p${j}_v`]}, p${j}_i='${dataClima[`p${j}_i`]}' WHERE fecha='${fechaDia}' AND ucp='${ucpMC}'`,
+              (ucpValor, ciudadIdValor) =>
+                `UPDATE datos_clima SET p${j}_t=${dataClima[`p${j}_t`]}, p${j}_h=${dataClima[`p${j}_h`]}, p${j}_v=${dataClima[`p${j}_v`]}, p${j}_i='${dataClima[`p${j}_i`]}' WHERE fecha='${fechaDia}' AND ${whereCiudad(ucpValor, ciudadIdValor)}`,
+              clave,
             );
           }
         }
@@ -458,6 +591,14 @@ const buscarInfoCiudad = async (dbEmpresa, ciudadKey) => {
     hist: row.accuweather_id,
     pron: row.openweather_id,
     nombre: row.ciudad_nombre || ciudadKey,
+    // ciudad_id liga esta fila con el catálogo maestro (catalogo_ciudades_
+    // clima) -- lo puso pronosticos_backend al guardar. Con esto la copia
+    // central (jano_proxy) se puede leer/escribir por ciudad en vez de por
+    // mercado. Si es null (mercado configurado antes de este cambio, o
+    // guardado sin ningún ID), procesarMercado cae de vuelta al nombre de
+    // la ciudad como llave — nunca al ucp del mercado, para no volver a
+    // atar el histórico a un mercado en particular.
+    ciudadId: row.ciudad_id ?? null,
   };
 };
 
@@ -509,7 +650,7 @@ export const climaController = async (req, res) => {
 
     // ── PASE 1: recolectar mercado+ciudad de cada empresa, sin llamar
     // todavía a AccuWeather/OpenWeatherMap ────────────────────────────────────
-    const trabajos = []; // { clientEmpresa, ucpMC, ciudadID_hist, ciudadID_pron, ciudadNombre, keyHist, keyPron }
+    const trabajos = []; // { clientEmpresa, ucpMC, ciudadID_hist, ciudadID_pron, ciudadNombre, ciudadId, keyHist, keyPron }
     const clientesEmpresa = [];
 
     for (const mercado of resultMercados.data) {
@@ -558,6 +699,7 @@ export const climaController = async (req, res) => {
             ciudadID_hist: ciudadInfo.hist,
             ciudadID_pron: ciudadInfo.pron,
             ciudadNombre: ciudadInfo.nombre,
+            ciudadId: ciudadInfo.ciudadId,
             keyHist,
             keyPron,
           });
@@ -621,6 +763,7 @@ export const climaController = async (req, res) => {
             trabajo.clientEmpresa,
             trabajo.ucpMC,
             trabajo.ciudadNombre,
+            trabajo.ciudadId,
             dataHistorico,
             dataPronostico,
           );
