@@ -9,4 +9,13 @@ export const QUERYS = {
   actualizarFechaClima: `SELECT * FROM datos_clima WHERE fecha = $1 AND ucp=$2`,
   buscarUltimasFechasClimaPronostico: `SELECT * FROM datos_clima WHERE ucp=$1 ORDER BY fecha DESC LIMIT $2`,
   buscarTemperatura: `SELECT * FROM datos_clima WHERE fecha = $1`,
+  buscarConfigCiudadClima: `SELECT * FROM config_ciudades_clima WHERE db_empresa = $1 AND ucp = $2`,
+
+  // Variantes por ciudad_id de las de arriba -- se usan SOLO contra la
+  // copia central (jano_proxy), para que mercados que comparten ciudad
+  // lean/escriban la misma fila en vez de una por mercado. La copia de
+  // respaldo en la BD de la empresa sigue usando las de arriba (por ucp).
+  buscarClimaPeriodosPorCiudad: `SELECT * FROM datos_clima WHERE ciudad_id=$1 AND fecha=$2`,
+  buscarFechaClimaPorCiudad: `SELECT * FROM datos_clima WHERE fecha = $1 AND ciudad_id=$2`,
+  buscarUltimasFechasClimaPronosticoPorCiudad: `SELECT * FROM datos_clima WHERE ciudad_id=$1 ORDER BY fecha DESC LIMIT $2`,
 };
