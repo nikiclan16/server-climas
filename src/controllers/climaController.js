@@ -119,27 +119,38 @@ const rellenarDiasHastaHoy = async (ucpMC, ultimaFecha, clientEmpresa) => {
   }
 };
 
+// ─── Llamadas a las APIs externas (una sola vez por ciudad, ver más abajo) ───
+const fetchHistorico = async (ciudadID_hist, keyHist) => {
+  const apiHistorico = `http://dataservice.accuweather.com/currentconditions/v1/${ciudadID_hist}/historical/24?apikey=${keyHist}&language=es&details=true`;
+  const responseHistorico = await fetch(apiHistorico);
+  return await responseHistorico.json();
+};
+
+const fetchPronostico = async (ciudadID_pron, keyPron) => {
+  const apiPronostico = `http://api.openweathermap.org/data/2.5/forecast?id=${ciudadID_pron}&APPID=${keyPron}&units=metric`;
+  const responsePronostico = await fetch(apiPronostico);
+  return await responsePronostico.json();
+};
+
 // ─── Procesador por mercado ───────────────────────────────────────────────────
+// dataHistorico/dataPronostico ya vienen descargados (una sola vez por
+// ciudad, ver climaController) — acá solo se escribe, por mercado, usando
+// esos mismos datos. Así dos mercados que comparten ciudad no duplican la
+// llamada a AccuWeather/OpenWeatherMap.
 const procesarMercado = async (
   clientEmpresa,
   ucpMC,
-  ciudadID_hist,
-  ciudadID_pron,
   ciudad,
-  keyHist,
-  keyPron,
-  totaldias,
+  dataHistorico,
+  dataPronostico,
 ) => {
   const log = (msg) =>
     saveLog(`${moment().format("DD-MM-YYYY HH:mm:ss")} => ${msg}\n`);
 
   // ── HISTÓRICO ──────────────────────────────────────────────────────────────
-  if (totaldias > 0 && ciudadID_hist && keyHist) {
+  if (dataHistorico) {
     try {
       log(`Iniciando Histórico para ${ciudad}`);
-      const apiHistorico = `http://dataservice.accuweather.com/currentconditions/v1/${ciudadID_hist}/historical/24?apikey=${keyHist}&language=es&details=true`;
-      const responseHistorico = await fetch(apiHistorico);
-      const dataHistorico = await responseHistorico.json();
 
       if (dataHistorico.length > 0) {
         let arrayHistorico = [];
@@ -255,13 +266,10 @@ const procesarMercado = async (
   }
 
   // ── PRONÓSTICO ─────────────────────────────────────────────────────────────
-  if (!ciudadID_pron || !keyPron) return;
+  if (!dataPronostico) return;
 
   try {
     log(`Iniciando Pronóstico para ${ciudad}`);
-    const apiPronostico = `http://api.openweathermap.org/data/2.5/forecast?id=${ciudadID_pron}&APPID=${keyPron}&units=metric`;
-    const responsePronostico = await fetch(apiPronostico);
-    const dataPronostico = await responsePronostico.json();
 
     if (dataPronostico.cod == 200 && dataPronostico.list?.length > 0) {
       for (const dataP of dataPronostico.list) {
@@ -499,10 +507,15 @@ export const climaController = async (req, res) => {
       return;
     }
 
-    // ── Por cada mercado, conectarse a su DB ──────────────────────────────────
+    // ── PASE 1: recolectar mercado+ciudad de cada empresa, sin llamar
+    // todavía a AccuWeather/OpenWeatherMap ────────────────────────────────────
+    const trabajos = []; // { clientEmpresa, ucpMC, ciudadID_hist, ciudadID_pron, ciudadNombre, keyHist, keyPron }
+    const clientesEmpresa = [];
+
     for (const mercado of resultMercados.data) {
       const session = mercado.accesos;
       const clientEmpresa = createConectionPG(session);
+      clientesEmpresa.push(clientEmpresa);
 
       try {
         await clientEmpresa.connect();
@@ -525,7 +538,6 @@ export const climaController = async (req, res) => {
           continue;
         }
 
-        // Procesar cada UCP manteniendo la conexión abierta para escritura dual
         for (const fila of ucpRows) {
           const ciudadKey = fila.aux2?.trim();
           const ciudadInfo = await buscarInfoCiudad(
@@ -540,23 +552,84 @@ export const climaController = async (req, res) => {
             continue;
           }
 
-          await procesarMercado(
+          trabajos.push({
             clientEmpresa,
-            ciudadKey,
-            ciudadInfo.hist,
-            ciudadInfo.pron,
-            ciudadInfo.nombre,
+            ucpMC: ciudadKey,
+            ciudadID_hist: ciudadInfo.hist,
+            ciudadID_pron: ciudadInfo.pron,
+            ciudadNombre: ciudadInfo.nombre,
             keyHist,
             keyPron,
-            totaldias,
-          );
+          });
         }
       } catch (err) {
         saveLog(
           `${moment().format("DD-MM-YYYY HH:mm:ss")} => Error en empresa ${session?.basededatos}: ${err.message}\n`,
         );
-      } finally {
-        // Siempre cerrar la conexión de la empresa al terminar todos sus UCPs
+      }
+    }
+
+    // ── PASE 2: agrupar por ciudad (mismo par de IDs AccuWeather/OWM = los
+    // mismos datos, sin importar qué mercado/empresa los pidió) y llamar a
+    // la API UNA sola vez por grupo — así dos mercados que comparten ciudad
+    // no duplican el consumo de cupo de AccuWeather/OpenWeatherMap ───────────
+    const grupos = new Map();
+    for (const trabajo of trabajos) {
+      const key = `${trabajo.ciudadID_hist || ""}|${trabajo.ciudadID_pron || ""}`;
+      if (!grupos.has(key)) grupos.set(key, { ...trabajo, trabajos: [] });
+      grupos.get(key).trabajos.push(trabajo);
+    }
+
+    try {
+      for (const grupo of grupos.values()) {
+        if (grupo.trabajos.length > 1) {
+          saveLog(
+            `${moment().format("DD-MM-YYYY HH:mm:ss")} => Ciudad compartida por ${grupo.trabajos.length} mercados (${grupo.trabajos.map((t) => t.ucpMC).join(", ")}) — 1 sola llamada a la API\n`,
+          );
+        }
+
+        let dataHistorico = null;
+        if (totaldias > 0 && grupo.ciudadID_hist && grupo.keyHist) {
+          try {
+            dataHistorico = await fetchHistorico(
+              grupo.ciudadID_hist,
+              grupo.keyHist,
+            );
+          } catch (err) {
+            saveLog(
+              `${moment().format("DD-MM-YYYY HH:mm:ss")} => Error descargando histórico para ${grupo.ciudadNombre}: ${err.message}\n`,
+            );
+          }
+        }
+
+        let dataPronostico = null;
+        if (grupo.ciudadID_pron && grupo.keyPron) {
+          try {
+            dataPronostico = await fetchPronostico(
+              grupo.ciudadID_pron,
+              grupo.keyPron,
+            );
+          } catch (err) {
+            saveLog(
+              `${moment().format("DD-MM-YYYY HH:mm:ss")} => Error descargando pronóstico para ${grupo.ciudadNombre}: ${err.message}\n`,
+            );
+          }
+        }
+
+        for (const trabajo of grupo.trabajos) {
+          await procesarMercado(
+            trabajo.clientEmpresa,
+            trabajo.ucpMC,
+            trabajo.ciudadNombre,
+            dataHistorico,
+            dataPronostico,
+          );
+        }
+      }
+    } finally {
+      // Cerrar todas las conexiones de empresa usadas, pase lo que pase en
+      // el pase 2 (misma garantía que el finally por-mercado que había antes).
+      for (const clientEmpresa of clientesEmpresa) {
         await clientEmpresa.end();
       }
     }
