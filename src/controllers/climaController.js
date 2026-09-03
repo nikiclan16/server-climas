@@ -67,7 +67,16 @@ const queryDualCiudad = async (
   build,
   { ucpMC, ciudad, ciudadId },
 ) => {
-  const sqlCentral = build(ciudad, ciudadId);
+  // Si ya se conoce ciudad_id, el central usa el nombre de la ciudad como
+  // valor legible de "ucp" (ej. "Medellin") -- ciudad_id es la llave real.
+  // Si NO se conoce (mercado sin migrar), el central debe caer EXACTAMENTE
+  // al mismo ucp del mercado que usaba antes de este cambio -- nunca al
+  // ciudad_nombre, que puede ser distinto del ucp bajo el que ya se venía
+  // acumulando histórico (ese fue justo el bug: usar ciudad_nombre acá
+  // cortaba la continuidad de cualquier mercado cuyo nombre de ciudad
+  // configurado no coincidiera con su propio ucp).
+  const ucpCentral = ciudadId != null ? ciudad : ucpMC;
+  const sqlCentral = build(ucpCentral, ciudadId);
   const sqlEmpresa = build(ucpMC, undefined);
 
   const results = await Promise.allSettled([
@@ -87,25 +96,27 @@ const queryDualCiudad = async (
 
 // Lecturas de la copia central (solo jano_proxy — "Lectura solo desde
 // jano_proxy como fuente de verdad", ver más abajo): por ciudad_id cuando
-// se conoce, por nombre de ciudad si no.
-const centralBuscarClimaPeriodos = (ciudadId, ciudad, fecha) =>
+// se conoce; si no, por el propio ucp del mercado (NUNCA por ciudad_nombre
+// — puede diferir del ucp bajo el que ya se venía acumulando histórico,
+// ver comentario en queryDualCiudad).
+const centralBuscarClimaPeriodos = (ciudadId, ucpMC, fecha) =>
   ciudadId != null
     ? pool.query(QUERYS.buscarClimaPeriodosPorCiudad, [ciudadId, fecha])
-    : pool.query(QUERYS.buscarClimaPeriodos, [ciudad, fecha]);
+    : pool.query(QUERYS.buscarClimaPeriodos, [ucpMC, fecha]);
 
-const centralBuscarFechaClima = (ciudadId, ciudad, fecha) =>
+const centralBuscarFechaClima = (ciudadId, ucpMC, fecha) =>
   ciudadId != null
     ? pool.query(QUERYS.buscarFechaClimaPorCiudad, [fecha, ciudadId])
-    : pool.query(QUERYS.buscarFechaClima, [fecha, ciudad]);
+    : pool.query(QUERYS.buscarFechaClima, [fecha, ucpMC]);
 
-const centralBuscarUltimasFechas = (ciudadId, ciudad, limite) =>
+const centralBuscarUltimasFechas = (ciudadId, ucpMC, limite) =>
   ciudadId != null
     ? pool.query(QUERYS.buscarUltimasFechasClimaPronosticoPorCiudad, [
         ciudadId,
         limite,
       ])
     : pool.query(QUERYS.buscarUltimasFechasClimaPronostico, [
-        ciudad,
+        ucpMC,
         limite,
       ]);
 
@@ -176,9 +187,9 @@ const rellenarDiasHastaHoy = async (
     fechaIterar.add(1, "days");
     const fechaNueva = fechaIterar.format("YYYY-MM-DD");
 
-    const search = await centralBuscarFechaClima(ciudadId, ciudad, fechaNueva);
+    const search = await centralBuscarFechaClima(ciudadId, ucpMC, fechaNueva);
     if (search.rowCount === 0) {
-      const ultimoDia = await centralBuscarUltimasFechas(ciudadId, ciudad, 1);
+      const ultimoDia = await centralBuscarUltimasFechas(ciudadId, ucpMC, 1);
       let dataClima = rellenarPeriodos(ultimoDia.rows[0]);
 
       await queryDualCiudad(
@@ -269,7 +280,7 @@ const procesarMercado = async (
           // Lectura solo desde jano_proxy como fuente de verdad
           const bfecha = await centralBuscarClimaPeriodos(
             ciudadId,
-            ciudad,
+            ucpMC,
             fechaAnterior,
           );
 
@@ -406,7 +417,7 @@ const procesarMercado = async (
 
         const search = await centralBuscarFechaClima(
           ciudadId,
-          ciudad,
+          ucpMC,
           fecha[0],
         );
         if (search.rowCount > 0) {
@@ -434,7 +445,7 @@ const procesarMercado = async (
       // Rellenar iconos faltantes
       const buscarIconos = await centralBuscarUltimasFechas(
         ciudadId,
-        ciudad,
+        ucpMC,
         13,
       );
       if (buscarIconos.rowCount > 0) {
@@ -466,7 +477,7 @@ const procesarMercado = async (
       }
 
       // Duplicar días hasta 12 días adelante
-      const row = await centralBuscarUltimasFechas(ciudadId, ciudad, 1);
+      const row = await centralBuscarUltimasFechas(ciudadId, ucpMC, 1);
       if (row.rowCount > 0) {
         for (let i = 0; i < 7; i++) {
           const diasiguiente = moment(row.rows[0].fecha)
@@ -474,7 +485,7 @@ const procesarMercado = async (
             .format("YYYY-MM-DD");
           const search = await centralBuscarFechaClima(
             ciudadId,
-            ciudad,
+            ucpMC,
             diasiguiente,
           );
           const fechaMaxima = moment().add(12, "days").format("YYYY-MM-DD");
@@ -500,7 +511,7 @@ const procesarMercado = async (
       }
 
       // Rellenar días hasta hoy si hay huecos
-      const row2 = await centralBuscarUltimasFechas(ciudadId, ciudad, 1);
+      const row2 = await centralBuscarUltimasFechas(ciudadId, ucpMC, 1);
       const ultimaFecha = ciudadId
         ? await pool.query(
             `SELECT MAX(fecha) AS ultima_fecha FROM public.datos_clima WHERE ciudad_id = $1 AND fecha < CURRENT_DATE`,
@@ -508,7 +519,7 @@ const procesarMercado = async (
           )
         : await pool.query(
             `SELECT MAX(fecha) AS ultima_fecha FROM public.datos_clima WHERE ucp = $1 AND fecha < CURRENT_DATE`,
-            [ciudad],
+            [ucpMC],
           );
       if (row2.rowCount > 0) {
         await rellenarDiasHastaHoy(
@@ -523,7 +534,7 @@ const procesarMercado = async (
           .format("YYYY-MM-DD");
         const search = await centralBuscarFechaClima(
           ciudadId,
-          ciudad,
+          ucpMC,
           diasiguiente,
         );
         const fechaMaxima = moment().add(12, "days").format("YYYY-MM-DD");
@@ -548,7 +559,7 @@ const procesarMercado = async (
       }
 
       // Relleno final de periodos vacíos en los últimos 13 días
-      const row3 = await centralBuscarUltimasFechas(ciudadId, ciudad, 13);
+      const row3 = await centralBuscarUltimasFechas(ciudadId, ucpMC, 13);
       if (row3.rowCount > 0) {
         for (const rowDia of row3.rows) {
           const dataClima = rellenarPeriodos(rowDia);
